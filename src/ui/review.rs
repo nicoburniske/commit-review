@@ -1,13 +1,12 @@
-//! The diff review, in the style of GitHub's "Files changed": a file tree
-//! with a filter beside the files, each with its header, comments and diff.
+//! file navigation, diff controls and floating comments
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::time::Duration;
 
-use blit::{Input, PointerButton, Sides, Sizing, WidgetId};
+use blit::{Absolute, Anchor as Placement, Easing, Input, Key, NodeTarget, Sense, Sides, Sizing, Transition, WidgetId};
 use blit_desktop::atom::Rectangle;
 use blit_desktop::layout::{flex, single, Align};
-use blit_desktop::style::{Border, BorderRadius};
 use blit_desktop::text::TextStyle;
 use blit_desktop::widget::{scroll, text_input, TextInput};
 use blit_desktop::{BoundsClip, Ui};
@@ -17,9 +16,9 @@ use crate::message::Scope;
 use crate::state::{CommentAt, FileReview, Restored};
 use crate::text::{self, Anchor};
 
-use super::lines;
-use super::theme;
+use super::theme::{self, sz};
 use super::widgets::{self, panel, Button, Checkbox, Look, ScrollArea, Tag};
+use super::{diff_view, lines};
 
 pub fn scope_label(scope: Scope) -> &'static str {
     match scope {
@@ -36,6 +35,8 @@ pub struct File {
     pub removed_label: String,
     pub viewed: bool,
     pub collapsed: bool,
+    pub source: Option<Result<Vec<Vec<crate::diff::Line>>, String>>,
+    pub context: Vec<diff_view::Context>,
     /// Pending comments, sent with the decision.
     pub comments: Vec<Comment>,
     /// Comments of an earlier attempt whose lines changed: not sent unless reopened.
@@ -43,6 +44,9 @@ pub struct File {
 }
 
 pub struct Comment {
+    pub id: WidgetId,
+    pub state: text_input::State,
+    pub focus: bool,
     pub anchor: Anchor,
     pub text: String,
     /// Carried over from an earlier attempt.
@@ -54,23 +58,25 @@ pub struct Outdated {
     pub text: String,
 }
 
-/// The comment box being written; one at a time.
-pub struct Form {
-    pub file: usize,
-    pub anchor: Anchor,
-    pub text: String,
-    pub state: text_input::State,
-    /// The index of the comment being edited, in its file.
-    pub editing: Option<usize>,
-    /// Takes the keyboard focus once built.
-    pub focus: bool,
-}
-
-impl Form {
-    pub fn new(file: usize, anchor: Anchor, text: String, editing: Option<usize>) -> Self {
+impl Comment {
+    pub fn new(anchor: Anchor, text: String, earlier: bool) -> Self {
         let end = text.len();
-        let state = text_input::State { cursor: end, anchor: end, offset_x: 0.0 };
-        Form { file, anchor, text, state, editing, focus: true }
+        Self {
+            id: WidgetId::unique(),
+            anchor,
+            text,
+            earlier,
+            state: text_input::State { cursor: end, anchor: end, offset_x: 0.0 },
+            focus: true,
+        }
+    }
+
+    pub fn at(&self, line: Option<usize>) -> bool {
+        match (self.anchor, line) {
+            (Anchor::File, None) => true,
+            (Anchor::Lines { start, end }, Some(line)) => (start..=end).contains(&line),
+            _ => false,
+        }
     }
 }
 
@@ -80,6 +86,14 @@ pub struct Drag {
     pub file: usize,
     pub start: usize,
     pub end: usize,
+    pub side: Option<bool>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Thread {
+    pub file: usize,
+    pub line: Option<usize>,
+    pub button: Option<usize>,
 }
 
 impl From<crate::Change> for File {
@@ -97,7 +111,21 @@ impl From<crate::Change> for File {
                 Kind::Context => {}
             }
         }
+        let mut old = 1;
+        let context = change
+            .diff
+            .hunks
+            .iter()
+            .map(|hunk| {
+                let total = Some((hunk.old.start - old) as usize);
+                old = hunk.old.end;
+                diff_view::Context { total, ..Default::default() }
+            })
+            .chain(std::iter::once(Default::default()))
+            .collect();
         let mut file = File {
+            context,
+            source: None,
             collapsed: change.viewed,
             viewed: change.viewed,
             diff: change.diff,
@@ -109,10 +137,8 @@ impl From<crate::Change> for File {
         };
         for restored in change.restored {
             match restored {
-                Restored::Lines { start, end, text } => {
-                    file.comments.push(Comment { anchor: Anchor::Lines { start, end }, text, earlier: true })
-                }
-                Restored::File { text } => file.comments.push(Comment { anchor: Anchor::File, text, earlier: true }),
+                Restored::Lines { start, end, text } => file.comments.push(Comment::new(Anchor::Lines { start, end }, text, true)),
+                Restored::File { text } => file.comments.push(Comment::new(Anchor::File, text, true)),
                 Restored::Outdated { quote, text } => file.outdated.push(Outdated { quote, text }),
             }
         }
@@ -123,17 +149,20 @@ impl From<crate::Change> for File {
 #[derive(Default)]
 pub struct Review {
     /// Read from git when the reviewer first opens the review.
-    files: Option<Result<Vec<File>, String>>,
-    tree: scroll::State,
-    entries: Tree,
-    list: scroll::State,
-    filter: String,
-    filter_state: text_input::State,
-    closed_dirs: HashSet<String>,
-    drag: Option<Drag>,
-    form: Option<Form>,
-    /// A file picked in the tree, scrolled to once laid out.
-    reveal: Option<usize>,
+    pub files: Option<Result<Vec<File>, String>>,
+    pub tree: scroll::State,
+    pub tree_width: Option<f32>,
+    pub tree_hidden: bool,
+    pub selected: usize,
+    pub split: bool,
+    pub entries: Tree,
+    pub list: diff_view::State,
+    pub thread: Option<Thread>,
+    pub reveal_comment: Option<(usize, Anchor)>,
+    pub popup: scroll::State,
+    pub filter: String,
+    pub filter_state: text_input::State,
+    pub drag: Option<Drag>,
 }
 
 impl Review {
@@ -141,6 +170,10 @@ impl Review {
         if self.files.is_none() {
             self.files = Some(crate::changes(command).map(|changes| changes.into_iter().map(File::from).collect()));
             self.entries = Tree::new(self.loaded().iter().map(|file| file.diff.path.as_str()));
+            if let Some(Ok(files)) = &self.files {
+                self.entries.update(files.iter().map(|file| file.diff.path.as_str()), &self.filter);
+                self.list.rows_dirty = true;
+            }
         }
     }
 
@@ -164,7 +197,12 @@ impl Review {
     pub fn comment_texts(&self) -> Vec<String> {
         self.loaded()
             .iter()
-            .flat_map(|file| file.comments.iter().map(|comment| text::comment(&file.diff, comment.anchor, &comment.text)))
+            .flat_map(|file| {
+                file.comments
+                    .iter()
+                    .filter(|comment| !comment.text.trim().is_empty())
+                    .map(|comment| text::comment(&file.diff, comment.anchor, &comment.text))
+            })
             .collect()
     }
 
@@ -182,6 +220,7 @@ impl Review {
                 comments: file
                     .comments
                     .iter()
+                    .filter(|comment| !comment.text.trim().is_empty())
                     .map(|comment| {
                         let (start, end) = match comment.anchor {
                             Anchor::File => (None, None),
@@ -197,128 +236,308 @@ impl Review {
 }
 
 pub fn build(ui: Ui<'_>, review: &mut Review, user: &str, consumed: &mut bool) {
-    let Review { files, tree, entries, list, filter, filter_state, closed_dirs, drag, form, reveal } = review;
-    let mut row = ui.layout(flex::row().gap(16.0));
+    let Review {
+        files, tree, tree_width, tree_hidden, selected, split, entries, list, filter, filter_state, thread, reveal_comment, ..
+    } = review;
+    let mut column = ui.layout(flex::column().gap(sz::MD));
     let files = match files {
         Some(Ok(files)) => files,
         Some(Err(error)) => {
             let message = format!("git error: {error}");
-            let shown = widgets::wrapped(&message, theme::mono(theme::CODE), theme::DANGER);
-            row.child(flex::item().width(Sizing::grow())).insert(shown);
+            let shown = widgets::wrapped(&message, theme::mono(sz::CODE), theme::DANGER);
+            column.child(flex::item().width(Sizing::grow())).insert(shown);
             return;
         }
         None => return,
     };
-    // A drag over the "+" buttons ends where the pointer is released.
-    if let (Some(selected), Input::PointerUp { button: PointerButton::Primary, .. }) = (*drag, *row.input()) {
-        *drag = None;
-        let anchor = Anchor::Lines { start: selected.start.min(selected.end), end: selected.start.max(selected.end) };
-        *form = Some(Form::new(selected.file, anchor, String::new(), None));
-    }
     let mut picked = None;
-    row.child(flex::item().width(Sizing::fixed(240.0)).height(Sizing::grow())).build(|ui: Ui<'_>| {
-        let mut pane = ui.layout(flex::column().gap(8.0));
-        pane.child(flex::item()).build(|ui: Ui<'_>| {
-            let mut field = ui.layout(single::layout().padding(Sides::xy(10.0, 6.0)));
-            field.insert(panel(theme::SURFACE));
-            let input = TextInput::new(filter_state, WidgetId::new("filter"), filter)
-                .style(theme::sans(13.0))
-                .color(theme::TEXT)
-                .placeholder("Filter files...")
-                .placeholder_color(theme::MUTED)
-                .selection_background(theme::SELECTED)
-                .cursor_background(theme::TEXT);
-            field.child(single::item().width(Sizing::grow())).build(input);
-        });
-        entries.update(files.iter().map(|file| file.diff.path.as_str()), filter, closed_dirs);
-        pane.child(flex::item().grow()).build(ScrollArea::new(tree, BoundsClip).build(|ui: Ui<'_>| {
-            let mut column = ui.layout(flex::column().gap(1.0));
-            for &position in &entries.visible {
-                let entry = &entries.all[position];
-                let label = &mut entries.label;
-                label.clear();
-                let id = match entry {
-                    Entry::Dir { path, name, depth, .. } => {
-                        let chevron = if closed_dirs.contains(path) { "▸" } else { "▾" };
-                        let _ = write!(label, "{:width$}{chevron}  {name}", "", width = depth * 4);
-                        WidgetId::new(("tree dir", path))
+    let mut navigate = None;
+    let previous_thread = *thread;
+    let reveal = reveal_comment.is_some();
+    if let Some((index, anchor)) = *reveal_comment {
+        filter.clear();
+        entries.update(files.iter().map(|file| file.diff.path.as_str()), filter);
+        files[index].collapsed = false;
+        list.rows_dirty = true;
+        *selected = index;
+        let line = match anchor {
+            Anchor::File => None,
+            Anchor::Lines { end, .. } => Some(end),
+        };
+        *thread = Some(Thread { file: index, line, button: line });
+    }
+    let typing = column.is_focused(WidgetId::new("notes")) || column.is_focused(WidgetId::new("filter")) || thread.is_some();
+    let mut focus_filter = false;
+    if let Input::Text(key) = *column.input() {
+        if !typing && !*consumed {
+            match key {
+                'b' => {
+                    *tree_hidden = !*tree_hidden;
+                    column.request_frame();
+                }
+                '/' => {
+                    *tree_hidden = false;
+                    focus_filter = true;
+                }
+                's' => {
+                    *split = !*split;
+                    list.rows_dirty = true;
+                    column.request_frame();
+                }
+                'j' | 'k' | 'v' => {
+                    if key == 'v' {
+                        if let Some(file) = files.get_mut(*selected) {
+                            file.viewed = true;
+                            file.collapsed = true;
+                            list.rows_dirty = true;
+                        }
                     }
-                    Entry::File { index, name, depth } => {
-                        let tick = if files[*index].viewed { "  ✓" } else { "" };
-                        let _ = write!(label, "{:width$}    {name}{tick}", "", width = depth * 4);
-                        WidgetId::new(("tree file", *index))
+                    navigate = Some(key == 'k');
+                    column.request_frame();
+                }
+                _ => {}
+            }
+        }
+    }
+    if matches!(column.input(), Input::Key(key) if key.pressed && key.key == Key::Escape) && column.is_focused(WidgetId::new("filter")) {
+        column.clear_focus();
+        *consumed = true;
+    }
+    column.child(flex::item()).build(|ui: Ui<'_>| {
+        let mut bar = ui.layout(flex::row().gap(sz::MD).align(Align::Center));
+        let toggle = if *tree_hidden { "▸ Files" } else { "▾ Files" };
+        if bar.child(flex::item()).build(Button::new(WidgetId::new("toggle files"), toggle).shortcut("b").look(Look::Quiet)) {
+            *tree_hidden = !*tree_hidden;
+            bar.request_frame();
+        }
+        let path = files.get(*selected).map_or("No changes", |file| file.display_path.as_str());
+        bar.child(flex::item().grow()).insert(widgets::text(path, theme::mono(sz::CODE), theme::TEXT));
+        for (label, backwards) in [("↑", true), ("↓", false)] {
+            if bar.child(flex::item()).build(Button::new(WidgetId::new(("navigate file", backwards)), label).look(Look::Quiet)) {
+                navigate = Some(backwards);
+                bar.request_frame();
+            }
+        }
+        for (label, value) in [("Unified", false), ("Split", true)] {
+            if bar.child(flex::item()).build(Button::new(WidgetId::new(("diff mode", value)), label).look(if *split == value {
+                Look::Selected
+            } else {
+                Look::Quiet
+            })) && *split != value
+            {
+                *split = value;
+                list.rows_dirty = true;
+                bar.request_frame();
+            }
+        }
+    });
+    if let Some(backwards) = navigate {
+        picked = if backwards {
+            (0..*selected).rev().find(|&i| entries.shown[i])
+        } else {
+            (*selected + 1..files.len()).find(|&i| entries.shown[i])
+        };
+    }
+    let mut row = column.child(flex::item().grow()).widget_id(WidgetId::new("review panes")).layout(flex::row());
+    if !*consumed && thread.is_some() && matches!(row.input(), Input::Key(key) if key.pressed && key.key == Key::Escape) {
+        *thread = None;
+        *consumed = true;
+        row.clear_focus();
+        row.request_frame();
+    }
+    let divider_id = WidgetId::new("file pane divider");
+    let divider = row.interact(divider_id, if *tree_hidden { Sense::default() } else { Sense::DRAG });
+    let maximum = row.geometry(WidgetId::new("review panes")).map_or(sz::SIDEBAR, |area| area.width - sz::SIDEBAR_MIN - sz::MD).max(0.0);
+    let width = (tree_width.unwrap_or(sz::SIDEBAR) + divider.drag_delta.x).clamp(sz::SIDEBAR_MIN.min(maximum), maximum);
+    if divider.drag_delta.x != 0.0 {
+        *tree_width = Some(width);
+        row.request_frame();
+    }
+    let transition = Transition::new(if divider.active { Duration::ZERO } else { theme::TRANSITION }).easing(Easing::EaseOutQuad).layout();
+    if !*tree_hidden {
+        row.child(flex::item().width(Sizing::fixed(width)).height(Sizing::grow()))
+            .widget_id(WidgetId::new("file pane"))
+            .transition(transition)
+            .clip(BoundsClip)
+            .build(|ui: Ui<'_>| {
+                let mut pane = ui.layout(flex::column().gap(sz::MD));
+                let filter_changed = pane.child(flex::item()).build(|ui: Ui<'_>| {
+                    let mut inset = ui.layout(single::layout().padding(Sides::new().left(sz::MD).right(sz::MD).top(sz::XS)));
+                    let ui = inset.child(single::item().width(Sizing::grow()));
+                    let mut field = ui.layout(single::layout().padding(Sides::xy(sz::MD, sz::SM)));
+                    field.insert(panel(theme::SURFACE));
+                    let input = TextInput::new(filter_state, WidgetId::new("filter"), filter)
+                        .style(theme::interface(sz::TEXT_BODY))
+                        .color(theme::TEXT)
+                        .placeholder("Filter files...")
+                        .placeholder_color(theme::MUTED)
+                        .selection_background(theme::SELECTED)
+                        .cursor_background(theme::TEXT);
+                    field.child(single::item().width(Sizing::grow())).build(input).changed
+                });
+                entries.update(files.iter().map(|file| file.diff.path.as_str()), filter);
+                if filter_changed {
+                    list.rows_dirty = true;
+                    if !entries.shown.get(*selected).copied().unwrap_or(false) {
+                        picked = entries.shown.iter().position(|&shown| shown);
                     }
-                };
-                let button = Button::new(id, label).look(Look::Quiet).style(theme::sans(13.0));
-                if column.child(flex::item()).build(button) {
-                    match entry {
-                        Entry::Dir { path, .. } => {
-                            if !closed_dirs.remove(path) {
-                                closed_dirs.insert(path.clone());
+                }
+                pane.child(flex::item().grow()).build(ScrollArea::new(tree, BoundsClip).build(|ui: Ui<'_>| {
+                    let mut column = ui.layout(flex::column().gap(sz::BORDER));
+                    for &position in &entries.visible {
+                        let entry = &entries.all[position];
+                        let label = &mut entries.label;
+                        label.clear();
+                        if let Entry::File { index, name, depth } = entry {
+                            let file = &files[*index];
+                            let id = WidgetId::new(("tree file", *index));
+                            column.child(flex::item()).build(|mut ui: Ui<'_>| {
+                                let interaction = ui.interact(id, Sense::CLICK);
+                                let mut line = ui.widget_id(id).layout(
+                                    flex::row()
+                                        .padding(
+                                            Sides::new().left(sz::MD + *depth as f32 * sz::LG).right(sz::SM).top(sz::SM).bottom(sz::SM),
+                                        )
+                                        .gap(sz::SM)
+                                        .align(Align::Center),
+                                );
+                                line.insert(Rectangle::new().background(if *selected == *index {
+                                    theme::SELECTED
+                                } else if interaction.hovered {
+                                    theme::RAISED
+                                } else {
+                                    theme::BACKGROUND
+                                }));
+                                line.child(flex::item()).insert(widgets::text(
+                                    if file.viewed { "✓" } else { "·" },
+                                    theme::mono(sz::TEXT_SMALL),
+                                    if file.viewed { theme::SUCCESS } else { theme::MUTED },
+                                ));
+                                line.child(flex::item().grow()).insert(widgets::text(
+                                    name,
+                                    theme::interface(sz::TEXT_SMALL),
+                                    if *selected == *index { theme::ACCENT } else { theme::TEXT },
+                                ));
+                                if !file.comments.is_empty() {
+                                    let _ = write!(label, "{}●", file.comments.len());
+                                    line.child(flex::item()).insert(widgets::text(label, theme::mono(sz::TEXT_TINY), theme::ACCENT));
+                                }
+                                line.child(flex::item()).insert(widgets::text(
+                                    &file.added_label,
+                                    theme::mono(sz::TEXT_TINY),
+                                    theme::SUCCESS,
+                                ));
+                                line.child(flex::item()).insert(widgets::text(
+                                    &file.removed_label,
+                                    theme::mono(sz::TEXT_TINY),
+                                    theme::DANGER,
+                                ));
+                                if interaction.clicked {
+                                    picked = Some(*index);
+                                    line.request_frame();
+                                }
+                            });
+                            continue;
+                        }
+                        let Entry::Dir { name, depth, collapsed, .. } = entry else { continue };
+                        let chevron = if *collapsed { "▸" } else { "▾" };
+                        let _ = write!(label, "{:width$}{chevron}  {name}", "", width = depth * 2);
+                        let id = WidgetId::new(("tree dir", position));
+                        let button = Button::new(id, label).look(Look::Quiet).style(theme::interface(sz::TEXT_BODY));
+                        if column.child(flex::item()).build(button) {
+                            if let Entry::Dir { collapsed, .. } = &mut entries.all[position] {
+                                *collapsed = !*collapsed;
                             }
                             entries.dirty = true;
                         }
-                        Entry::File { index, .. } => picked = Some(*index),
                     }
-                }
-            }
-        }));
-    });
+                }));
+            });
+        row.child(flex::item().width(Sizing::fixed(sz::MD)).height(Sizing::grow())).widget_id(divider_id).insert(
+            Rectangle::new().background(if divider.active {
+                theme::ACCENT
+            } else if divider.hovered {
+                theme::BORDER
+            } else {
+                theme::SURFACE
+            }),
+        );
+    }
 
     if let Some(index) = picked {
+        *selected = index;
+    }
+    if let Some(index) = picked.filter(|&index| files[index].collapsed) {
         files[index].collapsed = false;
-        *reveal = Some(index);
+        list.rows_dirty = true;
     }
-    if let Some(index) = *reveal {
-        let content = list.id.child("content");
-        if let (Some(target), Some(top)) = (row.geometry(file_id(index)), row.geometry(content)) {
-            list.scroll_to(target.y - top.y);
-            *reveal = None;
-        }
-        row.request_frame();
+    if focus_filter {
+        row.focus(WidgetId::new("filter"));
     }
-
-    row.child(flex::item().grow()).build(ScrollArea::new(list, BoundsClip).build(|ui: Ui<'_>| {
-        let mut column = ui.layout(flex::column().gap(14.0).padding(Sides::new().right(10.0)));
-        if files.is_empty() {
-            let note = widgets::text("(nothing to commit in this scope)", theme::sans(theme::BODY), theme::MUTED);
-            column.child(flex::item()).insert(note);
-        }
-        for (index, file) in files.iter_mut().enumerate() {
-            if entries.shown[index] {
-                column
-                    .child(flex::item())
-                    .widget_id(file_id(index))
-                    .build(|ui: Ui<'_>| file_box(ui, index, file, drag, form, user, consumed));
+    let anchor = row
+        .child(flex::item().grow())
+        .widget_id(WidgetId::new("diff pane"))
+        .transition(transition)
+        .build(|ui: Ui<'_>| diff_view::build(ui, review, picked));
+    let Review { files, list, thread, popup, .. } = review;
+    let Some(Ok(files)) = files else { return };
+    if previous_thread != *thread || reveal {
+        popup.scroll_to(0.0);
+        if let Some(open) = thread {
+            if let Some(comment) = files[open.file].comments.iter_mut().find(|comment| comment.at(open.line)) {
+                comment.focus = true;
             }
         }
-    }));
-}
-
-fn file_id(index: usize) -> WidgetId {
-    WidgetId::new(("file", index))
-}
-
-fn file_box(ui: Ui<'_>, index: usize, file: &mut File, drag: &mut Option<Drag>, form: &mut Option<Form>, user: &str, consumed: &mut bool) {
-    let mut boxed = ui.layout(flex::column());
-    boxed.insert(Rectangle::new().border(Border::solid(1.0, theme::BORDER)).radius(BorderRadius::uniform(theme::RADIUS)));
-    boxed.child(flex::item()).build(|ui: Ui<'_>| header(ui, index, file, form));
-    if !file.collapsed {
-        boxed.child(flex::item()).build(|ui: Ui<'_>| lines::body(ui, index, file, drag, form, user, consumed));
+    }
+    if let (Some(Thread { file: index, line, .. }), Some(anchor)) = (*thread, anchor) {
+        let screen = row.screen();
+        let bounds = row.geometry(list.list.id()).unwrap_or(screen);
+        let width = sz::POPOVER_WIDTH.min((bounds.width - sz::XL).max(1.0));
+        let max_height = (bounds.height - sz::XL).max(1.0);
+        let height = row.geometry(popup.id.child("content")).map_or(sz::POPOVER_HEIGHT, |area| area.height).min(max_height);
+        let target = row.geometry(anchor);
+        let below = target.is_none_or(|target| target.y + target.height + height + sz::MD <= bounds.y + bounds.height);
+        let x = target.map_or(0.0, |target| {
+            target.x.clamp(bounds.x + sz::MD, (bounds.x + bounds.width - width - sz::MD).max(bounds.x + sz::MD)) - target.x
+        });
+        let y = target.map_or(0.0, |target| {
+            let top = if below { target.y + target.height + sz::XS } else { target.y - height - sz::XS };
+            top.clamp(bounds.y + sz::MD, (bounds.y + bounds.height - height - sz::MD).max(bounds.y + sz::MD)) - top
+        });
+        if target.is_none() || row.geometry(popup.id).is_none_or(|area| area.height != height || area.width != width) {
+            row.request_frame();
+        }
+        let placement = Absolute::attach(
+            if below { Placement::BottomLeft } else { Placement::TopLeft },
+            if below { Placement::TopLeft } else { Placement::BottomLeft },
+        )
+        .relative_to(anchor)
+        .offset(x, y + if below { sz::XS } else { -sz::XS })
+        .width(Sizing::fixed(width))
+        .height(Sizing::fit_range(0.0, max_height));
+        let mut close = false;
+        row.absolute(placement).parent(NodeTarget::Root).z_index(10).build(ScrollArea::new(popup, BoundsClip).build(|ui: Ui<'_>| {
+            close = lines::popover(ui, &mut files[index], line, user, consumed);
+        }));
+        if close {
+            *thread = None;
+            row.clear_focus();
+            row.request_frame();
+        }
+    }
+    for (index, file) in files.iter_mut().enumerate() {
+        file.comments
+            .retain(|comment| !comment.text.trim().is_empty() || thread.is_some_and(|open| open.file == index && comment.at(open.line)));
     }
 }
 
-fn header(ui: Ui<'_>, index: usize, file: &mut File, form: &mut Option<Form>) {
-    let mut row = ui.layout(flex::row().padding(Sides::xy(10.0, 6.0)).gap(10.0).align(Align::Center));
-    let radius = if file.collapsed {
-        BorderRadius::uniform(theme::RADIUS)
-    } else {
-        BorderRadius::new().top_left(theme::RADIUS).top_right(theme::RADIUS)
-    };
-    row.insert(Rectangle::new().background(theme::SURFACE).radius(radius));
+pub fn header(ui: Ui<'_>, index: usize, file: &File, label: &mut String) -> Option<HeaderAction> {
+    let mut action = None;
+    let mut row = ui.layout(flex::row().padding(Sides::xy(sz::MD, sz::SM)).gap(sz::MD).align(Align::Center));
+    row.insert(Rectangle::new().background(theme::SURFACE));
     let chevron = if file.collapsed { "▸" } else { "▾" };
     if row.child(flex::item()).build(Button::new(WidgetId::new(("chevron", index)), chevron).look(Look::Quiet)) {
-        file.collapsed = !file.collapsed;
+        action = Some(HeaderAction::Collapse);
     }
     let (status, color) = match file.diff.status {
         Status::Added => ("added", theme::SUCCESS),
@@ -327,26 +546,42 @@ fn header(ui: Ui<'_>, index: usize, file: &mut File, form: &mut Option<Form>) {
         Status::Modified => ("modified", theme::WARNING),
     };
     row.child(flex::item()).build(Tag { label: status, color });
-    let bold = TextStyle { weight: 600, ..theme::mono(theme::CODE) };
+    let bold = TextStyle { weight: 600, ..theme::mono(sz::CODE) };
     row.child(flex::item().width(Sizing::grow())).insert(widgets::text(&file.display_path, bold, theme::TEXT));
-    row.child(flex::item()).insert(widgets::text(&file.added_label, theme::mono(theme::CODE), theme::SUCCESS));
-    row.child(flex::item()).insert(widgets::text(&file.removed_label, theme::mono(theme::CODE), theme::DANGER));
-    if row.child(flex::item()).build(Checkbox { id: WidgetId::new(("viewed", index)), label: "Viewed", checked: file.viewed }) {
-        file.viewed = !file.viewed;
-        file.collapsed = file.viewed;
+    row.child(flex::item()).insert(widgets::text(&file.added_label, theme::mono(sz::CODE), theme::SUCCESS));
+    row.child(flex::item()).insert(widgets::text(&file.removed_label, theme::mono(sz::CODE), theme::DANGER));
+    if row.child(flex::item()).build(Checkbox { id: WidgetId::new(("viewed", index)), label: "Reviewed", checked: file.viewed }) {
+        action = Some(HeaderAction::Viewed);
     }
-    let comment = Button::new(WidgetId::new(("file comment", index)), "Comment").look(Look::Quiet).style(theme::sans(theme::SMALL));
+    let count = file.comments.iter().filter(|comment| matches!(comment.anchor, Anchor::File)).count() + file.outdated.len();
+    let label = if count == 0 {
+        "Comment"
+    } else {
+        label.clear();
+        let _ = write!(label, "Comments ({count})");
+        label.as_str()
+    };
+    let comment = Button::new(WidgetId::new(("file comment", index)), label).look(Look::Quiet).style(theme::interface(sz::TEXT_SMALL));
     if row.child(flex::item()).build(comment) {
-        file.collapsed = false;
-        *form = Some(Form::new(index, Anchor::File, String::new(), None));
+        action = Some(HeaderAction::Comment);
     }
+    if action.is_some() {
+        row.request_frame();
+    }
+    action
+}
+
+pub enum HeaderAction {
+    Collapse,
+    Viewed,
+    Comment,
 }
 
 #[derive(Default)]
-struct Tree {
+pub struct Tree {
     all: Vec<Entry>,
     visible: Vec<usize>,
-    shown: Vec<bool>,
+    pub shown: Vec<bool>,
     filter: String,
     label: String,
     dirty: bool,
@@ -360,12 +595,11 @@ impl Tree {
             files: Vec<(String, usize)>,
         }
 
-        fn walk(node: Node, prefix: &str, depth: usize, entries: &mut Vec<Entry>) {
+        fn walk(node: Node, depth: usize, entries: &mut Vec<Entry>) {
             for (name, child) in node.dirs {
-                let path = format!("{prefix}{name}/");
                 let position = entries.len();
-                entries.push(Entry::Dir { path: path.clone(), name, depth, end: 0 });
-                walk(child, &path, depth + 1, entries);
+                entries.push(Entry::Dir { name, depth, end: 0, collapsed: false });
+                walk(child, depth + 1, entries);
                 let end = entries.len();
                 if let Entry::Dir { end: slot, .. } = &mut entries[position] {
                     *slot = end;
@@ -391,11 +625,11 @@ impl Tree {
             }
         }
         let mut all = Vec::new();
-        walk(root, "", 0, &mut all);
+        walk(root, 0, &mut all);
         Self { all, shown, dirty: true, ..Self::default() }
     }
 
-    fn update<'a>(&mut self, paths: impl Iterator<Item = &'a str>, filter: &str, closed: &HashSet<String>) {
+    fn update<'a>(&mut self, paths: impl Iterator<Item = &'a str>, filter: &str) {
         let filter = filter.trim();
         if self.filter != filter {
             self.filter.clear();
@@ -414,13 +648,13 @@ impl Tree {
         let mut position = 0;
         while position < self.all.len() {
             match &self.all[position] {
-                Entry::Dir { path, end, .. } => {
+                Entry::Dir { collapsed, end, .. } => {
                     let matches =
                         self.all[position + 1..*end].iter().any(|entry| matches!(entry, Entry::File { index, .. } if self.shown[*index]));
                     if matches {
                         self.visible.push(position);
                     }
-                    if !matches || closed.contains(path) {
+                    if !matches || *collapsed {
                         position = *end;
                         continue;
                     }
@@ -437,6 +671,6 @@ impl Tree {
 }
 
 enum Entry {
-    Dir { path: String, name: String, depth: usize, end: usize },
+    Dir { name: String, depth: usize, end: usize, collapsed: bool },
     File { index: usize, name: String, depth: usize },
 }

@@ -14,12 +14,58 @@ pub struct FileDiff {
     pub status: Status,
     pub binary: bool,
     pub hunks: Vec<Hunk>,
+    /// immutable base blob for optional source context
+    pub source: Option<String>,
 }
 
 impl FileDiff {
     /// All lines of all hunks in order: what the review indexes.
     pub fn lines(&self) -> impl Iterator<Item = &Line> {
         self.hunks.iter().flat_map(|h| h.lines.iter())
+    }
+
+    pub fn context(&self, source: &str) -> Result<Vec<Vec<Line>>, String> {
+        let mut lines = source.lines();
+        let mut gaps = Vec::with_capacity(self.hunks.len() + 1);
+        let (mut old, mut new) = (1, 1);
+        for hunk in &self.hunks {
+            let mut gap = Vec::new();
+            while old < hunk.old.start {
+                let text = lines.next().ok_or("Source does not match the diff")?;
+                gap.push(Line {
+                    kind: Kind::Context,
+                    old: Some(old),
+                    new: Some(new),
+                    text: text.to_owned(),
+                });
+                old += 1;
+                new += 1;
+            }
+            for line in hunk.lines.iter().filter(|line| line.old.is_some()) {
+                if lines.next() != Some(line.text.as_str()) {
+                    return Err("Source does not match the diff".into());
+                }
+            }
+            old = hunk.old.end;
+            new = hunk.new.end;
+            gaps.push(gap);
+        }
+        gaps.push(
+            lines
+                .map(|text| {
+                    let line = Line {
+                        kind: Kind::Context,
+                        old: Some(old),
+                        new: Some(new),
+                        text: text.to_owned(),
+                    };
+                    old += 1;
+                    new += 1;
+                    line
+                })
+                .collect(),
+        );
+        Ok(gaps)
     }
 }
 
@@ -34,6 +80,8 @@ pub enum Status {
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Hunk {
     pub header: String,
+    pub old: std::ops::Range<u32>,
+    pub new: std::ops::Range<u32>,
     pub lines: Vec<Line>,
 }
 
@@ -68,12 +116,26 @@ pub enum Kind {
 
 pub fn changes(scope: Scope, amend: bool) -> Result<Vec<FileDiff>, String> {
     let base = base(amend);
-    let mut args = vec!["diff", "--no-color", "--no-ext-diff", "--find-renames", "-U3"];
+    let mut args = vec![
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "--find-renames",
+        "-U3",
+    ];
     if scope == Scope::Staged {
         args.push("--cached");
     }
     args.push(&base);
     let mut files = parse(&git::diff(&args)?);
+    for file in &mut files {
+        if !file.binary && !matches!(file.status, Status::Added | Status::Deleted) {
+            file.source = Some(format!(
+                "{base}:{}",
+                file.old_path.as_deref().unwrap_or(&file.path)
+            ));
+        }
+    }
     if scope == Scope::Worktree {
         for path in git::run(&["ls-files", "--others", "--exclude-standard"])?.lines() {
             let text = git::diff(&["diff", "--no-color", "--no-index", "/dev/null", path])?;
@@ -101,6 +163,7 @@ pub fn parse(diff: &str) -> Vec<FileDiff> {
                 status: Status::Modified,
                 binary: false,
                 hunks: Vec::new(),
+                source: None,
             });
             continue;
         }
@@ -108,8 +171,14 @@ pub fn parse(diff: &str) -> Vec<FileDiff> {
             continue;
         };
         if let Some(rest) = line.strip_prefix("@@ ") {
-            (old_no, new_no) = hunk_starts(rest);
-            file.hunks.push(Hunk { header: line.to_string(), lines: Vec::new() });
+            let (old, new) = hunk_starts(rest);
+            (old_no, new_no) = (old.start, new.start);
+            file.hunks.push(Hunk {
+                header: line.to_string(),
+                old,
+                new,
+                lines: Vec::new(),
+            });
         } else if let Some(hunk) = file.hunks.last_mut() {
             let (kind, old, new) = match line.chars().next() {
                 Some('+') => (Kind::Add, None, Some(new_no)),
@@ -120,7 +189,12 @@ pub fn parse(diff: &str) -> Vec<FileDiff> {
             };
             old_no += u32::from(old.is_some());
             new_no += u32::from(new.is_some());
-            hunk.lines.push(Line { kind, old, new, text: line[1..].to_string() });
+            hunk.lines.push(Line {
+                kind,
+                old,
+                new,
+                text: line[1..].to_string(),
+            });
         } else if line == "--- /dev/null" {
             file.status = Status::Added;
         } else if line == "+++ /dev/null" {
@@ -147,14 +221,18 @@ fn path_from_header(header: &str) -> String {
 }
 
 /// Start line numbers of `-old,count +new,count @@ heading`.
-fn hunk_starts(rest: &str) -> (u32, u32) {
+fn hunk_starts(rest: &str) -> (std::ops::Range<u32>, std::ops::Range<u32>) {
     let mut parts = rest.split(' ');
-    let mut start = |sign: char| -> u32 {
-        parts
+    let mut start = |sign: char| {
+        let mut range = parts
             .next()
             .and_then(|p| p.strip_prefix(sign))
-            .and_then(|p| p.split(',').next()?.parse().ok())
-            .unwrap_or(0)
+            .unwrap_or("")
+            .split(',');
+        let start = range.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+        let count = range.next().map_or(1, |n| n.parse().unwrap_or(0));
+        let start = start + u32::from(count == 0);
+        start..start + count
     };
     let old = start('-');
     let new = start('+');
@@ -166,7 +244,59 @@ mod tests {
     use super::*;
 
     fn line(kind: Kind, old: Option<u32>, new: Option<u32>, text: &str) -> Line {
-        Line { kind, old, new, text: text.to_string() }
+        Line {
+            kind,
+            old,
+            new,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn source_context_preserves_gaps_and_line_numbers() {
+        let file = parse("diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -3 +3,2 @@\n-3\n+three\n+extra\n@@ -7 +7,0 @@\n-7\n").remove(0);
+        let gaps = file.context("1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n\n").unwrap();
+        assert_eq!(
+            gaps[0],
+            vec![
+                line(Kind::Context, Some(1), Some(1), "1"),
+                line(Kind::Context, Some(2), Some(2), "2")
+            ]
+        );
+        assert_eq!(
+            gaps[1],
+            vec![
+                line(Kind::Context, Some(4), Some(5), "4"),
+                line(Kind::Context, Some(5), Some(6), "5"),
+                line(Kind::Context, Some(6), Some(7), "6"),
+            ]
+        );
+        assert_eq!(gaps[2][0], line(Kind::Context, Some(8), Some(8), "8"));
+        assert_eq!(
+            gaps[2].last().unwrap(),
+            &line(Kind::Context, Some(11), Some(11), "")
+        );
+        assert!(file.context("1\n2\nwrong\n").is_err());
+    }
+
+    #[test]
+    fn source_context_handles_empty_ranges_and_unchanged_renames() {
+        let file = parse("diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -0,0 +1 @@\n+prefix\n@@ -2,0 +4 @@\n+suffix\n").remove(0);
+        let gaps = file.context("one\ntwo\n").unwrap();
+        assert!(gaps[0].is_empty() && gaps[2].is_empty());
+        assert_eq!(
+            gaps[1],
+            vec![
+                line(Kind::Context, Some(1), Some(2), "one"),
+                line(Kind::Context, Some(2), Some(3), "two"),
+            ]
+        );
+        let file = parse("diff --git a/f b/g\nrename from f\nrename to g\n").remove(0);
+        assert!(file.source.is_none());
+        assert_eq!(
+            file.context("one\n").unwrap(),
+            vec![vec![line(Kind::Context, Some(1), Some(1), "one")]]
+        );
     }
 
     #[test]
@@ -195,8 +325,14 @@ mod tests {
         let diff = "diff --git a/new.txt b/new.txt\nnew file mode 100644\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,2 @@\n+one\n+two\ndiff --git a/old.rs b/moved.rs\nsimilarity index 90%\nrename from old.rs\nrename to moved.rs\n--- a/old.rs\n+++ b/moved.rs\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/img.png b/img.png\nBinary files a/img.png and b/img.png differ\n";
         let files = parse(diff);
         assert_eq!(files.len(), 3);
-        assert_eq!((files[0].status, files[0].path.as_str()), (Status::Added, "new.txt"));
-        assert_eq!(files[0].hunks[0].lines[1], line(Kind::Add, None, Some(2), "two"));
+        assert_eq!(
+            (files[0].status, files[0].path.as_str()),
+            (Status::Added, "new.txt")
+        );
+        assert_eq!(
+            files[0].hunks[0].lines[1],
+            line(Kind::Add, None, Some(2), "two")
+        );
         assert_eq!(files[1].status, Status::Renamed);
         assert_eq!(files[1].old_path.as_deref(), Some("old.rs"));
         assert_eq!(files[1].path, "moved.rs");
@@ -210,6 +346,9 @@ mod tests {
         let diff = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n--- not a header\n+++ not one either\n";
         let lines = &parse(diff)[0].hunks[0].lines;
         assert_eq!(lines[0], line(Kind::Del, Some(1), None, "-- not a header"));
-        assert_eq!(lines[1], line(Kind::Add, None, Some(1), "++ not one either"));
+        assert_eq!(
+            lines[1],
+            line(Kind::Add, None, Some(1), "++ not one either")
+        );
     }
 }

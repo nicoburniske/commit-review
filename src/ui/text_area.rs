@@ -12,16 +12,7 @@ use blit_desktop::widget::text_input::State;
 use blit_desktop::{DesktopPlatform, Ui};
 
 use super::marked::{boundaries, span_rects};
-use super::theme;
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Response {
-    pub changed: bool,
-    /// Ctrl or Cmd with Enter.
-    pub submitted: bool,
-    /// Escape, while focused.
-    pub escaped: bool,
-}
+use super::theme::{self, sz};
 
 pub struct TextArea<'a> {
     pub state: &'a mut State,
@@ -33,30 +24,31 @@ pub struct TextArea<'a> {
 }
 
 impl Widget<DesktopPlatform> for TextArea<'_> {
-    type Response = Response;
+    type Response = bool;
 
-    fn build(self, mut ui: Ui<'_>) -> Response {
+    fn build(self, mut ui: Ui<'_>) -> bool {
         let Self { state, id, value, placeholder, rows } = self;
         let interaction = ui.interact(id, Sense::FOCUS);
         let focused = ui.is_focused(id);
         let input = *ui.input();
-        let style = theme::sans(13.0);
-        let options = TextOptions { wrap: TextWrap::Word, ..TextOptions::default() };
-        let mut response = Response::default();
+        let style = theme::interface(sz::TEXT_BODY);
+        let options = TextOptions { wrap: TextWrap::Character, ..TextOptions::default() };
+        let mut close = false;
+        let mut changed = false;
         let mut vertical = None;
         if focused {
             match input {
                 Input::Key(key) if key.pressed => {
                     let command = key.modifiers.control() || key.modifiers.super_key();
                     match key.key {
-                        Key::Escape => response.escaped = true,
-                        Key::Enter if command => response.submitted = true,
-                        Key::Enter => response.changed = insert(state, value, "\n"),
+                        Key::Escape => close = true,
+                        Key::Enter if command => close = true,
+                        Key::Enter => changed = insert(state, value, "\n"),
                         Key::ArrowUp => vertical = Some((false, key.modifiers.shift())),
                         Key::ArrowDown => vertical = Some((true, key.modifiers.shift())),
                         Key::Character('v' | 'V') if command => {
                             if let Some(pasted) = paste() {
-                                response.changed = insert(state, value, &pasted.replace("\r\n", "\n"));
+                                changed = insert(state, value, &pasted.replace("\r\n", "\n"));
                             }
                         }
                         Key::Character('c' | 'C' | 'x' | 'X') if command => {
@@ -64,14 +56,14 @@ impl Widget<DesktopPlatform> for TextArea<'_> {
                             if start != end {
                                 copy(&value[start..end]);
                                 if matches!(key.key, Key::Character('x' | 'X')) {
-                                    response.changed = insert(state, value, "");
+                                    changed = insert(state, value, "");
                                 }
                             }
                         }
-                        _ => response.changed = state.update(value, &input).changed,
+                        _ => changed = state.update(value, &input).changed,
                     }
                 }
-                _ => response.changed = state.update(value, &input).changed,
+                _ => changed = state.update(value, &input).changed,
             }
         }
         let text = ui.platform().text_run(value, style);
@@ -97,6 +89,9 @@ impl Widget<DesktopPlatform> for TextArea<'_> {
         } else {
             ui.request_frame();
         }
+        if changed {
+            ui.request_frame();
+        }
         let (start, end) = selection(state, value);
         let empty = value.is_empty();
         let display = if empty { ui.platform().text_run(placeholder, style) } else { text };
@@ -110,7 +105,7 @@ impl Widget<DesktopPlatform> for TextArea<'_> {
             options,
             min_height: style.size * 1.2 * f32::from(rows),
         });
-        response
+        close
     }
 }
 
@@ -130,8 +125,7 @@ fn insert(state: &mut State, value: &mut String, text: &str) -> bool {
 
 /// The clipboard as text, or nothing when the tool is missing.
 fn paste() -> Option<String> {
-    let (program, args): (&str, &[&str]) =
-        if cfg!(target_os = "macos") { ("pbpaste", &[]) } else { ("wl-paste", &["--no-newline"]) };
+    let (program, args): (&str, &[&str]) = if cfg!(target_os = "macos") { ("pbpaste", &[]) } else { ("wl-paste", &["--no-newline"]) };
     let out = Command::new(program).args(args).stderr(Stdio::null()).output().ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -163,7 +157,7 @@ impl Atom<DesktopPlatform> for Field {
     fn measure(&self, platform: &mut DesktopPlatform, constraints: Constraints) -> Size {
         let size = platform.measure_text(&TextLayoutRequest {
             text: self.display,
-            wrap: TextWrap::Word,
+            wrap: self.options.wrap,
             max_width: constraints.max.width.is_finite().then_some(constraints.max.width),
             max_lines: None,
         });
@@ -177,7 +171,7 @@ impl Atom<DesktopPlatform> for Field {
         }
         if self.focused {
             let caret = platform.text_cursor_rect(&request, self.cursor);
-            let caret = LogicalRect::new(caret.x, caret.y, caret.width.max(1.0), caret.height);
+            let caret = LogicalRect::new(caret.x, caret.y, caret.width.max(sz::BORDER), caret.height);
             platform.paint_rectangle(Fill::new(caret).background(theme::TEXT));
         }
         let color = if self.placeholder { theme::MUTED } else { theme::TEXT };

@@ -38,7 +38,7 @@ struct Change {
 /// What the summary shows.
 struct Context {
     repo: String,
-    status: String,
+    branch: String,
     /// The reviewer, from git config, for the comment boxes.
     user: String,
     /// The command the agent is about to run, when known.
@@ -171,7 +171,7 @@ fn context(command: Option<&str>) -> Result<Context, String> {
     });
     Ok(Context {
         repo: git::run(&["rev-parse", "--show-toplevel"])?,
-        status: git::run(&["status", "--short"])?,
+        branch: git::run(&["branch", "--show-current"]).unwrap_or_default(),
         user: git::run(&["config", "user.name"]).unwrap_or_else(|_| "You".to_string()),
         scope: scope_of(command),
         command: command.map(str::to_string),
