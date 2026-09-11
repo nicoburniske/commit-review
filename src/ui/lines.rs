@@ -2,12 +2,12 @@
 //! comment on it, dragged to select a range; comments and the comment form
 //! sit under the last line they quote.
 
-use blit::{state, Sense, Sides, Sizing, WidgetId};
+use blit::{state, Axis, Constraints, Layout, LayoutCx, Platform, Point, Sense, Sides, Size, Sizing, WidgetId};
 use blit_desktop::atom::Rectangle;
 use blit_desktop::color::Color;
 use blit_desktop::layout::{flex, single, Align, Justify};
 use blit_desktop::style::BorderRadius;
-use blit_desktop::text::{HorizontalAlign, TextOptions, TextWrap};
+use blit_desktop::text::{HorizontalAlign, TextOptions, TextWrap, VerticalAlign};
 use blit_desktop::Ui;
 
 use crate::diff::{Kind, Line};
@@ -78,12 +78,11 @@ pub(super) fn body(
             });
             for line in &hunk.lines {
                 let highlighted = selected.is_some_and(|(start, end)| (start..=end).contains(&flat));
-                let commented = file.comments.iter().any(|comment| {
-                    matches!(comment.anchor, Anchor::Lines { start, end } if (start..=end).contains(&flat))
-                });
-                column
-                    .child(flex::item())
-                    .build(|ui: Ui<'_>| line_row(ui, index, flat, line, highlighted, commented, drag));
+                let commented = file
+                    .comments
+                    .iter()
+                    .any(|comment| matches!(comment.anchor, Anchor::Lines { start, end } if (start..=end).contains(&flat)));
+                column.child(flex::item()).build(|ui: Ui<'_>| line_row(ui, index, flat, line, highlighted, commented, drag));
                 let has_thread = file.comments.iter().any(|comment| sits(comment.anchor, Some(flat)))
                     || form.as_ref().is_some_and(|open| open.file == index && sits(open.anchor, Some(flat)));
                 if has_thread {
@@ -169,40 +168,97 @@ fn line_row(ui: Ui<'_>, index: usize, flat: usize, line: &Line, highlighted: boo
     };
     let (line_color, number_color) = if highlighted { (theme::SELECTED, theme::SELECTED) } else { (line_color, number_color) };
     let mono = theme::mono(theme::CODE);
-    let mut cells = ui.widget_id(row_id).layout(flex::row());
+    let mut cells = ui.widget_id(row_id).layout(LineLayout);
     cells.insert(Rectangle::new().background(line_color));
+    cells.child(Cell::Numbers).insert(Rectangle::new().background(number_color));
     let bar = if commented { theme::WARNING } else { Color::TRANSPARENT };
-    cells.child(flex::item().fixed(BAR, theme::LINE)).insert(Rectangle::new().background(bar));
-    for number in [line.old, line.new] {
-        cells.child(flex::item().width(Sizing::fixed(NUMBER))).build(|ui: Ui<'_>| {
-            let mut cell = ui.layout(single::layout().padding(Sides::new().right(8.0).top(2.0)));
-            cell.insert(Rectangle::new().background(number_color));
-            let shown = number.map(|number| number.to_string()).unwrap_or_default();
-            let options = TextOptions { horizontal_align: HorizontalAlign::Right, ..TextOptions::default() };
-            cell.child(single::item().width(Sizing::grow())).insert(widgets::text(&shown, mono, theme::MUTED).options(options));
-        });
+    cells.child(Cell::Bar).insert(Rectangle::new().background(bar));
+    let mut buffer = itoa::Buffer::new();
+    for (cell, number) in [(Cell::Old, line.old), (Cell::New, line.new)] {
+        let shown = number.map_or("", |number| buffer.format(number));
+        let options = TextOptions { horizontal_align: HorizontalAlign::Right, ..TextOptions::default() };
+        cells.child(cell).insert(widgets::text(shown, mono, theme::MUTED).options(options));
     }
-    cells.child(flex::item().fixed(PLUS, theme::LINE)).build(|ui: Ui<'_>| {
-        if !(row.hovered || plus.hovered || plus.active) {
-            return;
+    if row.hovered || plus.hovered || plus.active {
+        let mut button = cells.child(Cell::Plus).widget_id(plus_id);
+        button.insert(Rectangle::new().background(theme::ACCENT).radius(BorderRadius::uniform(4.0)));
+        let options =
+            TextOptions { horizontal_align: HorizontalAlign::Center, vertical_align: VerticalAlign::Center, ..TextOptions::default() };
+        button.insert(widgets::text("+", theme::bold(14.0), theme::WHITE).options(options));
+    }
+    cells.child(Cell::Marker).insert(widgets::text(marker, mono, theme::MUTED));
+    let options = TextOptions { wrap: TextWrap::Character, ..TextOptions::default() };
+    cells.child(Cell::Code).insert(widgets::text(&line.text, mono, theme::TEXT).options(options));
+}
+
+struct LineLayout;
+
+#[derive(Clone, Copy)]
+enum Cell {
+    Code,
+    Old,
+    New,
+    Marker,
+    Plus,
+    Bar,
+    Numbers,
+}
+
+impl<P: Platform> Layout<P> for LineLayout {
+    type Item = Cell;
+
+    fn layout(&self, ui: &mut LayoutCx<'_, P, Cell>, constraints: Constraints) -> Size {
+        let width = constraints.max.width;
+        let res = ui.resolution();
+        let bar = res.extent(Axis::Horizontal, BAR);
+        let number = res.extent(Axis::Horizontal, NUMBER);
+        let gutter = bar + number * 2.0 + res.extent(Axis::Horizontal, PLUS);
+        let marker = res.extent(Axis::Horizontal, 14.0);
+        let top = res.extent(Axis::Vertical, 2.0);
+        let line_height = res.extent(Axis::Vertical, theme::LINE);
+        let mut height = line_height;
+        let mut numbers_height = top;
+        let mut numbers = None;
+        for child in ui.children() {
+            let (x, y, width, bottom, fixed_height) = match ui.item(child) {
+                Cell::Code => (gutter + marker, top, (width - gutter - marker - res.extent(Axis::Horizontal, 12.0)).max(0.0), top, None),
+                Cell::Old => (bar, top, (number - res.extent(Axis::Horizontal, 8.0)).max(0.0), 0.0, None),
+                Cell::New => (bar + number, top, (number - res.extent(Axis::Horizontal, 8.0)).max(0.0), 0.0, None),
+                Cell::Marker => (gutter, top, marker, top, None),
+                Cell::Plus => (
+                    bar + number * 2.0 + res.extent(Axis::Horizontal, 2.0),
+                    res.extent(Axis::Vertical, 1.0),
+                    res.extent(Axis::Horizontal, 18.0),
+                    0.0,
+                    Some(res.extent(Axis::Vertical, 18.0)),
+                ),
+                Cell::Bar => (0.0, 0.0, bar, 0.0, Some(line_height)),
+                Cell::Numbers => {
+                    numbers = Some(child);
+                    continue;
+                }
+            };
+            let bounds = Constraints {
+                min: Size::new(width, fixed_height.unwrap_or(0.0)),
+                max: Size::new(width, fixed_height.unwrap_or((constraints.max.height - y - bottom).max(0.0))),
+            };
+            let size = ui.layout_child(child, bounds);
+            ui.set_child_position(child, Point::new(x, y));
+            height = height.max(y + size.height + bottom);
+            if matches!(ui.item(child), Cell::Old | Cell::New) {
+                numbers_height = numbers_height.max(y + size.height);
+            }
         }
-        let mut cell = ui.layout(single::layout().padding(Sides::new().left(2.0).top(1.0)));
-        cell.child(single::item().fixed(18.0, 18.0)).widget_id(plus_id).build(|ui: Ui<'_>| {
-            let mut button = ui.layout(flex::row().align(Align::Center).justify(Justify::Center));
-            button.insert(Rectangle::new().background(theme::ACCENT).radius(BorderRadius::uniform(4.0)));
-            button.child(flex::item()).insert(widgets::text("+", theme::bold(14.0), theme::WHITE));
-        });
-    });
-    let padding = Sides::new().top(2.0).bottom(2.0);
-    cells.child(flex::item().width(Sizing::fixed(14.0))).build(|ui: Ui<'_>| {
-        let mut cell = ui.layout(single::layout().padding(padding));
-        cell.child(single::item()).insert(widgets::text(marker, mono, theme::MUTED));
-    });
-    cells.child(flex::item().width(Sizing::grow())).build(|ui: Ui<'_>| {
-        let mut cell = ui.layout(single::layout().padding(padding.right(12.0)));
-        let options = TextOptions { wrap: TextWrap::Character, ..TextOptions::default() };
-        cell.child(single::item().width(Sizing::grow())).insert(widgets::text(&line.text, mono, theme::TEXT).options(options));
-    });
+        if let Some(child) = numbers {
+            ui.layout_child(child, Constraints::tight(Size::new(number * 2.0, numbers_height)));
+            ui.set_child_position(child, Point::new(bar, 0.0));
+        }
+        constraints.constrain(Size::new(width, height))
+    }
+
+    fn override_size(&self, _: &mut Cell, _: Option<f32>, _: Option<f32>) -> bool {
+        false
+    }
 }
 
 fn thread_area(ui: Ui<'_>) -> Ui<'_, state::Open<flex::Layout>> {

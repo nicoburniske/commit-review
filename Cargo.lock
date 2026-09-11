@@ -275,6 +275,7 @@ dependencies = [
  "blit-desktop",
  "blit-text",
  "blit-text-cosmic",
+ "itoa",
  "regex",
  "serde",
  "serde_json",
