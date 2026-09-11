@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use blit::{Absolute, Anchor as Placement, Easing, Input, Key, NodeTarget, Sense, Sides, Sizing, Transition, WidgetId};
 use blit_desktop::atom::Rectangle;
-use blit_desktop::layout::{flex, single, Align};
+use blit_desktop::layout::{flex, single, Align, Justify};
 use blit_desktop::text::TextStyle;
 use blit_desktop::widget::{scroll, text_input, TextInput};
 use blit_desktop::{BoundsClip, Ui};
@@ -347,7 +347,7 @@ pub fn build(ui: Ui<'_>, review: &mut Review, user: &str, consumed: &mut bool) {
     }
     let divider_id = WidgetId::new("file pane divider");
     let divider = row.interact(divider_id, if *tree_hidden { Sense::default() } else { Sense::DRAG });
-    let maximum = row.geometry(WidgetId::new("review panes")).map_or(sz::SIDEBAR, |area| area.width - sz::SIDEBAR_MIN - sz::MD).max(0.0);
+    let maximum = row.geometry(WidgetId::new("review panes")).map_or(sz::SIDEBAR, |area| area.width - sz::SIDEBAR_MIN - sz::LG).max(0.0);
     let width = (tree_width.unwrap_or(sz::SIDEBAR) + divider.drag_delta.x).clamp(sz::SIDEBAR_MIN.min(maximum), maximum);
     if divider.drag_delta.x != 0.0 {
         *tree_width = Some(width);
@@ -453,14 +453,12 @@ pub fn build(ui: Ui<'_>, review: &mut Review, user: &str, consumed: &mut bool) {
                     }
                 }));
             });
-        row.child(flex::item().width(Sizing::fixed(sz::MD)).height(Sizing::grow())).widget_id(divider_id).insert(
-            Rectangle::new().background(if divider.active {
-                theme::ACCENT
-            } else if divider.hovered {
-                theme::BORDER
-            } else {
-                theme::SURFACE
-            }),
+        let mut grip = row
+            .child(flex::item().width(Sizing::fixed(sz::LG)).height(Sizing::grow()))
+            .widget_id(divider_id)
+            .layout(flex::row().align(Align::Center).justify(Justify::Center));
+        grip.child(flex::item().fixed(sz::XS, sz::XXXL)).insert(
+            Rectangle::new().background(if divider.active || divider.hovered { theme::ACCENT } else { theme::MUTED }),
         );
     }
 

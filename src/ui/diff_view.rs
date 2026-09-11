@@ -43,6 +43,7 @@ enum Kind {
 pub fn build(mut ui: Ui<'_>, review: &mut Review, reveal: Option<usize>) -> Option<WidgetId> {
     let Review { files, entries, list: state, drag, thread, split, selected: selected_file, reveal_comment, .. } = review;
     let Some(Ok(files)) = files else { return None };
+    // preserve the first visible line when switching columns
     let viewport = ui.geometry(state.list.id());
     let anchor = (state.split != *split)
         .then(|| {
@@ -57,6 +58,7 @@ pub fn build(mut ui: Ui<'_>, review: &mut Review, reveal: Option<usize>) -> Opti
         })
         .flatten();
     state.split = *split;
+    // flatten visible files into stable rows
     if state.rows_dirty {
         state.rows_dirty = false;
         state.rows.clear();
@@ -125,50 +127,22 @@ pub fn build(mut ui: Ui<'_>, review: &mut Review, reveal: Option<usize>) -> Opti
         }
         state.list.mark_dirty();
     }
-    let comment_target = reveal_comment.take();
-    if let Some((file, anchor)) = comment_target {
-        if let Some(row) = state.rows.iter().find(|row| {
-            row.file == file
-                && match anchor {
-                    Anchor::File => matches!(row.kind, Kind::Header),
-                    Anchor::Lines { end, .. } => matches!(row.kind, Kind::Code { left, right }
-                if [left, right].into_iter().flatten().any(|line| matches!(line, LineRef::Diff { flat, .. } if flat == end))),
-                }
-        }) {
-            state.list.scroll_to(row.id(*split));
-        }
-    } else if let Some(file) = reveal {
-        state.list.scroll_to(Row { file, kind: Kind::Header }.id(*split));
-    } else if let Some((file, kind)) = anchor {
-        if let Some(row) = state.rows.iter().find(|row| {
-            row.file == file
-                && match kind {
-                    Kind::Code { left, right } => {
-                        let line = right.or(left);
-                        matches!(row.kind, Kind::Code { left, right } if left == line || right == line)
-                    }
-                    _ => row.kind == kind,
-                }
-        }) {
-            state.list.scroll_to(row.id(*split));
-        }
+    // explicit navigation takes precedence over the saved scroll anchor
+    let navigation = reveal_comment.take().or(reveal.map(|file| (file, Anchor::File)));
+    let target = state.rows.iter().find(|row| match (navigation, anchor) {
+        (Some((file, Anchor::File)), _) => row.file == file && row.kind == Kind::Header,
+        (Some((file, Anchor::Lines { end, .. })), _) => row.file == file && matches!(row.kind,
+            Kind::Code { left, right } if [left, right].into_iter().flatten().any(|line| matches!(line, LineRef::Diff { flat, .. } if flat == end))),
+        (None, Some((file, kind))) => row.file == file && match kind {
+            Kind::Code { left, right } => matches!(row.kind, Kind::Code { left: l, right: r } if [l, r].contains(&right.or(left))),
+            _ => row.kind == kind,
+        },
+        _ => false,
+    });
+    if let Some(row) = target {
+        state.list.scroll_to(row.id(*split));
     }
 
-    let released = drag.is_some() && matches!(ui.input(), Input::PointerUp { button: PointerButton::Primary, .. });
-    let cancelled = matches!(ui.input(), Input::Key(key) if key.pressed && key.key == blit::Key::Escape);
-    if drag.is_some() {
-        if released || cancelled || matches!(ui.input(), Input::PointerMove { .. }) {
-            ui.request_frame();
-        }
-        if cancelled {
-            *drag = None;
-        }
-    }
-    let selected = *drag;
-    let mut started = None;
-    let mut header_action = None;
-    let mut context_action = None;
-    let mut open_anchor = None;
     if let Some(viewport) = viewport {
         match *ui.input() {
             Input::Scroll { position, .. } if viewport.contains(position) => state.follow_scroll = true,
@@ -180,18 +154,31 @@ pub fn build(mut ui: Ui<'_>, review: &mut Review, reveal: Option<usize>) -> Opti
             _ => {}
         }
     }
-    if reveal.is_some() || comment_target.is_some() {
+    if navigation.is_some() {
         state.follow_scroll = false;
     }
-    let follow_scroll = state.follow_scroll;
+    let input = *ui.input();
+    // schedule selection updates before the list consumes ui
+    if drag.is_some() && input != Input::None {
+        ui.request_frame();
+    }
+    // build rows and collect actions
+    let mut started = None;
+    let mut header_action = None;
+    let mut context_action = None;
+    let mut open_anchor = None;
     let mut visible_file = None;
     let response = ui.build(
         widgets::VirtualList::new(&mut state.list, BoundsClip, &state.rows)
             .key(|row| row.id(*split))
-            .edge_scroll(selected.is_some() && !released)
+            .edge_scroll(match input {
+                Input::PointerUp { button: PointerButton::Primary, .. } => false,
+                Input::Key(key) if key.pressed && key.key == blit::Key::Escape => false,
+                _ => drag.is_some(),
+            })
             .build(|ui: Ui<'_>, row| {
                 let mut ui = ui.widget_id(row.id(*split));
-                if follow_scroll && visible_file.is_none() && matches!(row.kind, Kind::Header | Kind::Code { .. }) {
+                if state.follow_scroll && visible_file.is_none() && matches!(row.kind, Kind::Header | Kind::Code { .. }) {
                     if let (Some(viewport), Some(area)) = (viewport, ui.geometry(row.id(*split))) {
                         if area.y + area.height > viewport.y && area.y < viewport.y + viewport.height {
                             visible_file = Some(row.file);
@@ -201,21 +188,19 @@ pub fn build(mut ui: Ui<'_>, review: &mut Review, reveal: Option<usize>) -> Opti
                         }
                     }
                 }
-                if row.kind == Kind::Empty {
-                    ui.insert(widgets::text(
-                        if files.is_empty() { "No changes in this scope." } else { "No files match the filter." },
-                        theme::interface(sz::TEXT_BODY),
-                        theme::MUTED,
-                    ));
-                    return;
-                }
-                if row.kind == Kind::Gap {
-                    ui.layout(single::layout().padding(Sides::y(sz::MD)));
-                    return;
-                }
-                let file = &files[row.file];
                 match row.kind {
+                    Kind::Empty => {
+                        ui.insert(widgets::text(
+                            if files.is_empty() { "No changes in this scope." } else { "No files match the filter." },
+                            theme::interface(sz::TEXT_BODY),
+                            theme::MUTED,
+                        ));
+                    }
+                    Kind::Gap => {
+                        ui.layout(single::layout().padding(Sides::y(sz::MD)));
+                    }
                     Kind::Separator { heading, context } => {
+                        let file = &files[row.file];
                         use blit_desktop::text::{HorizontalAlign, TextOptions, VerticalAlign};
                         use ContextAction::*;
                         let mut bar =
@@ -280,18 +265,19 @@ pub fn build(mut ui: Ui<'_>, review: &mut Review, reveal: Option<usize>) -> Opti
                         if thread.is_some_and(|thread| thread.file == row.file && thread.button.is_none()) {
                             open_anchor = Some(WidgetId::new(("file comment", row.file)));
                         }
-                        if let Some(action) = review::header(ui, row.file, file, &mut state.label) {
+                        if let Some(action) = review::header(ui, row.file, &files[row.file], &mut state.label) {
                             header_action = Some((row.file, action));
                         }
                     }
                     Kind::Code { left, right } => {
-                        let mut pair = ui.layout(CodeLayout { split: *split });
+                        let file = &files[row.file];
+                        let mut pair = ui.layout(CodeLayout);
                         pair.insert(Rectangle::new().background(theme::SURFACE));
                         for (source, side) in [(left, false), (right, true)].into_iter().take(if *split { 2 } else { 1 }) {
                             if side {
-                                pair.child(CodeCell::Divider).insert(Rectangle::new().background(theme::BORDER));
+                                pair.child(()).insert(Rectangle::new().background(theme::BORDER));
                             }
-                            let cell = pair.child(CodeCell::Line);
+                            let cell = pair.child(());
                             let Some(source) = source else { continue };
                             let side = (*split).then_some(side);
                             let (line, flat) = match source {
@@ -304,17 +290,16 @@ pub fn build(mut ui: Ui<'_>, review: &mut Review, reveal: Option<usize>) -> Opti
                             let (mut highlighted, mut commented, mut show_plus) = (false, false, Some(false));
                             if let Some(flat) = flat {
                                 let open = thread.is_some_and(|thread| thread.file == row.file && thread.button == Some(flat));
-                                highlighted = selected.as_ref().is_some_and(|drag| {
+                                highlighted = drag.as_ref().is_some_and(|drag| {
                                     drag.file == row.file && (drag.start.min(drag.end)..=drag.start.max(drag.end)).contains(&flat)
                                 }) || open;
                                 commented = file.comments.iter().any(|comment| comment.at(Some(flat)));
-                                show_plus = selected.map(|drag| drag.file == row.file && drag.end == flat).or_else(|| {
-                                    (open
-                                        || file
-                                            .comments
-                                            .iter()
-                                            .any(|comment| matches!(comment.anchor, Anchor::Lines { end, .. } if end == flat)))
-                                    .then_some(true)
+                                show_plus = drag.map(|drag| drag.file == row.file && drag.end == flat).or_else(|| {
+                                    let at_end = file
+                                        .comments
+                                        .iter()
+                                        .any(|comment| matches!(comment.anchor, Anchor::Lines { end, .. } if end == flat));
+                                    (open || at_end).then_some(true)
                                 });
                                 if open && show_plus == Some(true) && (side != Some(false) || line.kind == Change::Del) {
                                     open_anchor = Some(WidgetId::new(("plus", row.file, flat)));
@@ -323,7 +308,6 @@ pub fn build(mut ui: Ui<'_>, review: &mut Review, reveal: Option<usize>) -> Opti
                             lines::line_row(cell, row.file, flat, line, highlighted, commented, show_plus, side, &mut started);
                         }
                     }
-                    Kind::Gap | Kind::Empty => {}
                     Kind::Binary => {
                         let mut row = ui.layout(single::layout().padding(Sides::xy(sz::LG, sz::MD)));
                         row.child(single::item()).insert(widgets::text(
@@ -335,15 +319,37 @@ pub fn build(mut ui: Ui<'_>, review: &mut Review, reveal: Option<usize>) -> Opti
                 }
             }),
     );
-    if let (Some(selected), Some(Row { file, kind: Kind::Code { left, right } })) =
-        (drag.as_mut(), response.pointer_row.map(|index| &state.rows[index]))
-    {
-        if *file == selected.file {
-            if let Some(LineRef::Diff { flat, .. }) = if selected.side == Some(true) { right } else { left } {
-                selected.end = *flat;
+    // extend or finish the comment selection
+    if let Some(started) = started {
+        *drag = Some(started);
+    } else if let Some(selected) = drag.as_mut() {
+        if let Some(Row { file, kind: Kind::Code { left, right } }) = response.pointer_row.map(|index| &state.rows[index]) {
+            if *file == selected.file {
+                if let Some(LineRef::Diff { flat, .. }) = if selected.side == Some(true) { right } else { left } {
+                    selected.end = *flat;
+                }
             }
         }
+        match input {
+            Input::PointerUp { button: PointerButton::Primary, .. } => {
+                let end = selected.start.max(selected.end);
+                let anchor = Anchor::Lines { start: selected.start.min(selected.end), end };
+                let file = &mut files[selected.file];
+                let existing = selected.start == selected.end && file.comments.iter().any(|comment| comment.at(Some(selected.end)));
+                if !existing {
+                    file.comments.push(Comment::new(anchor, String::new(), false));
+                }
+                *thread = Some(Thread { file: selected.file, line: Some(end), button: Some(selected.end) });
+                *drag = None;
+            }
+            Input::Key(key) if key.pressed && key.key == blit::Key::Escape => *drag = None,
+            _ => {}
+        }
     }
+    if let Some(file) = visible_file {
+        *selected_file = file;
+    }
+    // load source context only when expanded
     if let Some((index, gap, action)) = context_action {
         let file = &mut files[index];
         if file.source.is_none() {
@@ -366,24 +372,17 @@ pub fn build(mut ui: Ui<'_>, review: &mut Review, reveal: Option<usize>) -> Opti
             let context = &mut file.context[gap];
             let first = context.before;
             use ContextAction::*;
-            match action {
-                Collapse => {
-                    context.before = 0;
-                    context.after = 0;
+            let Context { before, after, .. } = *context;
+            (context.before, context.after) = match action {
+                Collapse => (0, 0),
+                All => (count, 0),
+                Above => (before, (after + 20).min(count - before)),
+                Below => ((before + 20).min(count - after), after),
+                Both => {
+                    let before = (before + 20).min(count - after);
+                    (before, (after + 20).min(count - before))
                 }
-                All => {
-                    context.before = count;
-                    context.after = 0;
-                }
-                _ => {
-                    if matches!(action, Below | Both) {
-                        context.before = (context.before + 20).min(count - context.after);
-                    }
-                    if matches!(action, Above | Both) {
-                        context.after = (context.after + 20).min(count - context.before);
-                    }
-                }
-            }
+            };
             let kind = if action == Collapse || count == 0 {
                 Kind::Separator { heading: None, context: Some(gap) }
             } else {
@@ -401,24 +400,7 @@ pub fn build(mut ui: Ui<'_>, review: &mut Review, reveal: Option<usize>) -> Opti
         }
         state.rows_dirty = true;
     }
-    if let Some(file) = visible_file {
-        *selected_file = file;
-    }
-    if let Some(started) = started {
-        *drag = Some(started);
-    }
-    if released {
-        if let Some(selected) = drag.take() {
-            let end = selected.start.max(selected.end);
-            let anchor = Anchor::Lines { start: selected.start.min(selected.end), end };
-            let existing =
-                selected.start == selected.end && files[selected.file].comments.iter().any(|comment| comment.at(Some(selected.end)));
-            if !existing {
-                files[selected.file].comments.push(Comment::new(anchor, String::new(), false));
-            }
-            *thread = Some(Thread { file: selected.file, line: Some(end), button: Some(selected.end) });
-        }
-    }
+    // apply file actions after rendering
     if let Some((index, action)) = header_action {
         state.follow_scroll = false;
         *selected_file = index;
@@ -479,33 +461,21 @@ impl Row {
     }
 }
 
-struct CodeLayout {
-    split: bool,
-}
-
-enum CodeCell {
-    Line,
-    Divider,
-}
+// children are left then optionally divider and right
+struct CodeLayout;
 
 impl<R: Platform> Layout<R> for CodeLayout {
-    type Item = CodeCell;
+    type Item = ();
 
-    fn layout(&self, ui: &mut LayoutCx<'_, R, CodeCell>, constraints: Constraints) -> Size {
-        let gap = if self.split { ui.resolution().extent(Axis::Horizontal, sz::BORDER) } else { 0.0 };
-        let width = (constraints.max.width - gap).max(0.0) / if self.split { 2.0 } else { 1.0 };
+    fn layout(&self, ui: &mut LayoutCx<'_, R, ()>, constraints: Constraints) -> Size {
+        let divider = ui.children().nth(1);
+        let gap = if divider.is_some() { ui.resolution().extent(Axis::Horizontal, sz::BORDER) } else { 0.0 };
+        let width = (constraints.max.width - gap).max(0.0) / if divider.is_some() { 2.0 } else { 1.0 };
         let mut height = constraints.min.height;
-        let mut x = 0.0;
-        let mut divider = None;
-        for child in ui.children() {
-            if matches!(ui.item(child), CodeCell::Divider) {
-                divider = Some(child);
-                continue;
-            }
+        for (index, child) in ui.children().step_by(2).enumerate() {
             let size = ui.layout_child(child, Constraints { min: Size::new(width, 0.0), max: Size::new(width, constraints.max.height) });
-            ui.set_child_position(child, Point::new(x, 0.0));
+            ui.set_child_position(child, Point::new(index as f32 * (width + gap), 0.0));
             height = height.max(size.height);
-            x += width + gap;
         }
         let size = constraints.constrain(Size::new(constraints.max.width, height));
         if let Some(divider) = divider {
@@ -515,7 +485,7 @@ impl<R: Platform> Layout<R> for CodeLayout {
         size
     }
 
-    fn override_size(&self, _: &mut CodeCell, _: Option<f32>, _: Option<f32>) -> bool {
+    fn override_size(&self, _: &mut (), _: Option<f32>, _: Option<f32>) -> bool {
         false
     }
 }
