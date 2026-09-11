@@ -1,6 +1,6 @@
 //! diff row measurement, selection and floating comment anchors
 
-use blit::{Axis, Constraints, Input, Layout, LayoutCx, Platform, Point, Sense, Sides, Size, Sizing, WidgetId};
+use blit::{Axis, Constraints, Input, Layout, LayoutCx, Platform, Point, PointerButton, Sense, Sides, Size, Sizing, WidgetId};
 use blit_desktop::atom::Rectangle;
 use blit_desktop::layout::{flex, single, Align};
 use blit_desktop::widget::scroll;
@@ -40,7 +40,7 @@ enum Kind {
     Empty,
 }
 
-pub fn build(ui: Ui<'_>, review: &mut Review, reveal: Option<usize>) -> Option<WidgetId> {
+pub fn build(mut ui: Ui<'_>, review: &mut Review, reveal: Option<usize>) -> Option<WidgetId> {
     let Review { files, entries, list: state, drag, thread, split, selected: selected_file, reveal_comment, .. } = review;
     let Some(Ok(files)) = files else { return None };
     let viewport = ui.geometry(state.list.id());
@@ -154,9 +154,18 @@ pub fn build(ui: Ui<'_>, review: &mut Review, reveal: Option<usize>) -> Option<W
         }
     }
 
+    let released = drag.is_some() && matches!(ui.input(), Input::PointerUp { button: PointerButton::Primary, .. });
+    let cancelled = matches!(ui.input(), Input::Key(key) if key.pressed && key.key == blit::Key::Escape);
+    if drag.is_some() {
+        if released || cancelled || matches!(ui.input(), Input::PointerMove { .. }) {
+            ui.request_frame();
+        }
+        if cancelled {
+            *drag = None;
+        }
+    }
     let selected = *drag;
     let mut started = None;
-    let mut released = false;
     let mut header_action = None;
     let mut context_action = None;
     let mut open_anchor = None;
@@ -176,33 +185,10 @@ pub fn build(ui: Ui<'_>, review: &mut Review, reveal: Option<usize>) -> Option<W
     }
     let follow_scroll = state.follow_scroll;
     let mut visible_file = None;
-    ui.build(
+    let response = ui.build(
         widgets::VirtualList::new(&mut state.list, BoundsClip, &state.rows)
             .key(|row| row.id(*split))
-            .on_drag(
-                selected.is_some(),
-                &mut |row: &Row| {
-                    selected.is_some_and(|selected| {
-                        row.file == selected.file
-                            && matches!(
-                                row.kind,
-                                Kind::Code { left: Some(LineRef::Diff { .. }), .. } | Kind::Code { right: Some(LineRef::Diff { .. }), .. }
-                            )
-                    })
-                },
-                &mut |event| {
-                    if event.cancelled {
-                        *drag = None;
-                        return;
-                    }
-                    if let (Some(selected), Some(Row { kind: Kind::Code { left, right }, .. })) = (drag.as_mut(), event.row) {
-                        if let Some(LineRef::Diff { flat, .. }) = if selected.side == Some(true) { right } else { left } {
-                            selected.end = *flat;
-                        }
-                    }
-                    released = event.released;
-                },
-            )
+            .edge_scroll(selected.is_some() && !released)
             .build(|ui: Ui<'_>, row| {
                 let mut ui = ui.widget_id(row.id(*split));
                 if follow_scroll && visible_file.is_none() && matches!(row.kind, Kind::Header | Kind::Code { .. }) {
@@ -349,6 +335,15 @@ pub fn build(ui: Ui<'_>, review: &mut Review, reveal: Option<usize>) -> Option<W
                 }
             }),
     );
+    if let (Some(selected), Some(Row { file, kind: Kind::Code { left, right } })) =
+        (drag.as_mut(), response.pointer_row.map(|index| &state.rows[index]))
+    {
+        if *file == selected.file {
+            if let Some(LineRef::Diff { flat, .. }) = if selected.side == Some(true) { right } else { left } {
+                selected.end = *flat;
+            }
+        }
+    }
     if let Some((index, gap, action)) = context_action {
         let file = &mut files[index];
         if file.source.is_none() {
