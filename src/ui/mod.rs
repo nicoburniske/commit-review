@@ -12,7 +12,7 @@ mod widgets;
 use std::cell::RefCell;
 
 use blit::{Absolute, Anchor, Input, Key, Point, PointerButton, Sense, Sides, Sizing, WidgetId};
-use blit_desktop::{cpu, Application, Config, EventLoopProxy, Root};
+use blit_desktop::{gpu, Application, Config, EventLoopProxy, Root};
 use blit_gui::{
     FontFamily, GuiContext, TextConfig, TextLayoutEngine, Ui,
     atom::Rectangle,
@@ -64,7 +64,7 @@ pub fn run(command: Option<String>, output: Output) -> Result<(), String> {
             layout_cache_capacity: 2 << 20,
         },
         text: engine,
-        graphics: Box::new(cpu::Backend::new(cpu::Config::default())),
+        graphics: Box::new(gpu::Backend::new(gpu::Config::default())),
     })
     .map_err(|e| e.to_string())
 }
