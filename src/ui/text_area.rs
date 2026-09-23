@@ -6,10 +6,12 @@ use std::io::Write as _;
 use std::process::{Command, Stdio};
 
 use blit::{Atom, Constraints, Input, Key, LogicalRect, Point, PointerButton, Sense, Size, Widget, WidgetId};
-use blit_cpu::command_list::Rectangle as Fill;
-use blit_desktop::text::{TextLayoutRequest, TextOptions, TextRequest, TextRunId, TextWrap};
-use blit_desktop::widget::text_input::State;
-use blit_desktop::{DesktopPlatform, Ui};
+use blit_gui::{
+    GuiContext, Ui,
+    display_list::Rectangle as Fill,
+    text::{TextLayoutRequest, TextOptions, TextRequest, TextRunId, TextWrap},
+    widget::text_input::State,
+};
 
 use super::marked::{boundaries, span_rects};
 use super::theme::{self, sz};
@@ -23,7 +25,7 @@ pub struct TextArea<'a> {
     pub rows: u16,
 }
 
-impl Widget<DesktopPlatform> for TextArea<'_> {
+impl Widget<GuiContext> for TextArea<'_> {
     type Response = bool;
 
     fn build(self, mut ui: Ui<'_>) -> bool {
@@ -66,13 +68,13 @@ impl Widget<DesktopPlatform> for TextArea<'_> {
                 _ => changed = state.update(value, &input).changed,
             }
         }
-        let text = ui.platform().text_run(value, style);
+        let text = ui.context().text_run(value, style);
         if let Some(area) = ui.geometry(id) {
             let request = TextRequest { text, area, offset_x: 0.0, color: theme::TEXT, options };
             if let Some((down, extend)) = vertical {
-                let caret = ui.platform().text_cursor_rect(&request, state.cursor);
+                let caret = ui.context().text_cursor_rect(&request, state.cursor);
                 let y = if down { caret.y + caret.height * 1.5 } else { caret.y - caret.height * 0.5 };
-                let offset = ui.platform().text_offset_at_position(&request, Point::new(caret.x, y));
+                let offset = ui.context().text_offset_at_position(&request, Point::new(caret.x, y));
                 state.move_to(value, offset, extend);
             }
             let pointer = match input {
@@ -83,7 +85,7 @@ impl Widget<DesktopPlatform> for TextArea<'_> {
                 _ => None,
             };
             if let (true, Some((position, extend))) = (focused, pointer) {
-                let offset = ui.platform().text_offset_at_position(&request, position);
+                let offset = ui.context().text_offset_at_position(&request, position);
                 state.move_to(value, offset, extend);
             }
         } else {
@@ -94,7 +96,7 @@ impl Widget<DesktopPlatform> for TextArea<'_> {
         }
         let (start, end) = selection(state, value);
         let empty = value.is_empty();
-        let display = if empty { ui.platform().text_run(placeholder, style) } else { text };
+        let display = if empty { ui.context().text_run(placeholder, style) } else { text };
         ui.widget_id(id).insert(Field {
             text,
             display,
@@ -153,8 +155,8 @@ struct Field {
     min_height: f32,
 }
 
-impl Atom<DesktopPlatform> for Field {
-    fn measure(&self, platform: &mut DesktopPlatform, constraints: Constraints) -> Size {
+impl Atom<GuiContext> for Field {
+    fn measure(&self, platform: &mut GuiContext, constraints: Constraints) -> Size {
         let size = platform.measure_text(&TextLayoutRequest {
             text: self.display,
             wrap: self.options.wrap,
@@ -164,7 +166,7 @@ impl Atom<DesktopPlatform> for Field {
         constraints.constrain(Size::new(size.width, size.height.max(self.min_height)))
     }
 
-    fn paint(&self, platform: &mut DesktopPlatform, area: LogicalRect) {
+    fn paint(&self, platform: &mut GuiContext, area: LogicalRect) {
         let request = TextRequest { text: self.text, area, offset_x: 0.0, color: theme::TEXT, options: self.options };
         for rect in span_rects(platform, &request, &self.selection) {
             platform.paint_rectangle(Fill::new(rect).background(theme::SELECTED));

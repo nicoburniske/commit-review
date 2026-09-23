@@ -4,10 +4,12 @@
 use std::ops::Range;
 
 use blit::{state, Atom, Constraints, Content, LogicalRect, Size};
-use blit_cpu::command_list::Rectangle as Fill;
-use blit_desktop::color::Color;
-use blit_desktop::text::{TextLayoutRequest, TextOptions, TextRequest, TextRunId, TextStyle, TextWrap};
-use blit_desktop::{DesktopPlatform, Ui};
+use blit_gui::{
+    GuiContext, Ui,
+    color::Color,
+    display_list::Rectangle as Fill,
+    text::{TextLayoutRequest, TextOptions, TextRequest, TextRunId, TextStyle, TextWrap},
+};
 
 use crate::message::Kind;
 
@@ -21,11 +23,11 @@ pub struct Marked<'a> {
     pub wrap: TextWrap,
 }
 
-impl Content<DesktopPlatform> for Marked<'_> {
+impl Content<GuiContext> for Marked<'_> {
     type Response = ();
 
     fn append(self, mut ui: Ui<'_, state::Node>) {
-        let run = ui.platform().text_run(self.text, self.style);
+        let run = ui.context().text_run(self.text, self.style);
         let marks = self
             .marks
             .iter()
@@ -45,8 +47,8 @@ struct MarkedAtom {
     marks: Vec<(Vec<usize>, Color)>,
 }
 
-impl Atom<DesktopPlatform> for MarkedAtom {
-    fn measure(&self, platform: &mut DesktopPlatform, constraints: Constraints) -> Size {
+impl Atom<GuiContext> for MarkedAtom {
+    fn measure(&self, platform: &mut GuiContext, constraints: Constraints) -> Size {
         let wraps = self.wrap != TextWrap::None && constraints.max.width.is_finite();
         constraints.constrain(platform.measure_text(&TextLayoutRequest {
             text: self.run,
@@ -56,7 +58,7 @@ impl Atom<DesktopPlatform> for MarkedAtom {
         }))
     }
 
-    fn paint(&self, platform: &mut DesktopPlatform, area: LogicalRect) {
+    fn paint(&self, platform: &mut GuiContext, area: LogicalRect) {
         let request = TextRequest {
             text: self.run,
             area,
@@ -90,7 +92,7 @@ pub fn boundaries(text: &str, range: Range<usize>) -> Vec<usize> {
 }
 
 /// One rectangle per laid-out line the offsets cross, from caret to caret.
-pub fn span_rects(platform: &mut DesktopPlatform, request: &TextRequest, offsets: &[usize]) -> Vec<LogicalRect> {
+pub fn span_rects(platform: &mut GuiContext, request: &TextRequest, offsets: &[usize]) -> Vec<LogicalRect> {
     let mut rects: Vec<LogicalRect> = Vec::new();
     for &offset in offsets {
         let caret = platform.text_cursor_rect(request, offset);

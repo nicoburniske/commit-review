@@ -1,7 +1,6 @@
 //! warm graphite surfaces and restrained instrument colors
 
-use blit_desktop::color::Color;
-use blit_desktop::text::{FontId, TextStyle};
+use blit_gui::{color::Color, text::{FontId, TextStyle}};
 
 pub const TRANSITION: std::time::Duration = std::time::Duration::from_millis(140);
 

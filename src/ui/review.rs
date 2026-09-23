@@ -5,11 +5,13 @@ use std::fmt::Write as _;
 use std::time::Duration;
 
 use blit::{Absolute, Anchor as Placement, Easing, Input, Key, NodeTarget, Sense, Sides, Sizing, Transition, WidgetId};
-use blit_desktop::atom::Rectangle;
-use blit_desktop::layout::{flex, single, Align, Justify};
-use blit_desktop::text::TextStyle;
-use blit_desktop::widget::{scroll, text_input, TextInput};
-use blit_desktop::{BoundsClip, Ui};
+use blit_gui::{
+    BoundsClip, Ui,
+    atom::Rectangle,
+    layout::{flex, single, Align, Justify},
+    text::TextStyle,
+    widget::{scroll_area, text_input, TextInput},
+};
 
 use crate::diff::{FileDiff, Kind, Status};
 use crate::message::Scope;
@@ -17,7 +19,7 @@ use crate::state::{CommentAt, FileReview, Restored};
 use crate::text::{self, Anchor};
 
 use super::theme::{self, sz};
-use super::widgets::{self, panel, Button, Checkbox, Look, ScrollArea, Tag};
+use super::widgets::{self, panel, Button, Checkbox, Look, Tag};
 use super::{diff_view, lines};
 
 pub fn scope_label(scope: Scope) -> &'static str {
@@ -150,7 +152,7 @@ impl From<crate::Change> for File {
 pub struct Review {
     /// Read from git when the reviewer first opens the review.
     pub files: Option<Result<Vec<File>, String>>,
-    pub tree: scroll::State,
+    pub tree: scroll_area::State,
     pub tree_width: Option<f32>,
     pub tree_hidden: bool,
     pub selected: usize,
@@ -159,7 +161,7 @@ pub struct Review {
     pub list: diff_view::State,
     pub thread: Option<Thread>,
     pub reveal_comment: Option<(usize, Anchor)>,
-    pub popup: scroll::State,
+    pub popup: scroll_area::State,
     pub filter: String,
     pub filter_state: text_input::State,
     pub drag: Option<Drag>,
@@ -245,7 +247,7 @@ pub fn build(ui: Ui<'_>, review: &mut Review, user: &str, consumed: &mut bool) {
         Some(Err(error)) => {
             let message = format!("git error: {error}");
             let shown = widgets::wrapped(&message, theme::mono(sz::CODE), theme::DANGER);
-            column.child(flex::item().width(Sizing::grow())).insert(shown);
+            column.child().item(flex::item().width(Sizing::grow())).insert(shown);
             return;
         }
         None => return,
@@ -303,23 +305,23 @@ pub fn build(ui: Ui<'_>, review: &mut Review, user: &str, consumed: &mut bool) {
         column.clear_focus();
         *consumed = true;
     }
-    column.child(flex::item()).build(|ui: Ui<'_>| {
+    column.child().item(flex::item()).build(|ui: Ui<'_>| {
         let mut bar = ui.layout(flex::row().gap(sz::MD).align(Align::Center));
         let toggle = if *tree_hidden { "▸ Files" } else { "▾ Files" };
-        if bar.child(flex::item()).build(Button::new(WidgetId::new("toggle files"), toggle).shortcut("b").look(Look::Quiet)) {
+        if bar.child().item(flex::item()).build(Button::new(WidgetId::new("toggle files"), toggle).shortcut("b").look(Look::Quiet)) {
             *tree_hidden = !*tree_hidden;
             bar.request_frame();
         }
         let path = files.get(*selected).map_or("No changes", |file| file.display_path.as_str());
-        bar.child(flex::item().grow()).insert(widgets::text(path, theme::mono(sz::CODE), theme::TEXT));
+        bar.child().item(flex::item().grow()).insert(widgets::text(path, theme::mono(sz::CODE), theme::TEXT));
         for (label, backwards) in [("↑", true), ("↓", false)] {
-            if bar.child(flex::item()).build(Button::new(WidgetId::new(("navigate file", backwards)), label).look(Look::Quiet)) {
+            if bar.child().item(flex::item()).build(Button::new(WidgetId::new(("navigate file", backwards)), label).look(Look::Quiet)) {
                 navigate = Some(backwards);
                 bar.request_frame();
             }
         }
         for (label, value) in [("Unified", false), ("Split", true)] {
-            if bar.child(flex::item()).build(Button::new(WidgetId::new(("diff mode", value)), label).look(if *split == value {
+            if bar.child().item(flex::item()).build(Button::new(WidgetId::new(("diff mode", value)), label).look(if *split == value {
                 Look::Selected
             } else {
                 Look::Quiet
@@ -338,7 +340,7 @@ pub fn build(ui: Ui<'_>, review: &mut Review, user: &str, consumed: &mut bool) {
             (*selected + 1..files.len()).find(|&i| entries.shown[i])
         };
     }
-    let mut row = column.child(flex::item().grow()).widget_id(WidgetId::new("review panes")).layout(flex::row());
+    let mut row = column.child().item(flex::item().grow()).widget_id(WidgetId::new("review panes")).layout(flex::row());
     if !*consumed && thread.is_some() && matches!(row.input(), Input::Key(key) if key.pressed && key.key == Key::Escape) {
         *thread = None;
         *consumed = true;
@@ -355,15 +357,15 @@ pub fn build(ui: Ui<'_>, review: &mut Review, user: &str, consumed: &mut bool) {
     }
     let transition = Transition::new(if divider.active { Duration::ZERO } else { theme::TRANSITION }).easing(Easing::EaseOutQuad).layout();
     if !*tree_hidden {
-        row.child(flex::item().width(Sizing::fixed(width)).height(Sizing::grow()))
+        row.child().item(flex::item().width(Sizing::fixed(width)).height(Sizing::grow()))
             .widget_id(WidgetId::new("file pane"))
             .transition(transition)
             .clip(BoundsClip)
             .build(|ui: Ui<'_>| {
                 let mut pane = ui.layout(flex::column().gap(sz::MD));
-                let filter_changed = pane.child(flex::item()).build(|ui: Ui<'_>| {
+                let filter_changed = pane.child().item(flex::item()).build(|ui: Ui<'_>| {
                     let mut inset = ui.layout(single::layout().padding(Sides::new().left(sz::MD).right(sz::MD).top(sz::XS)));
-                    let ui = inset.child(single::item().width(Sizing::grow()));
+                    let ui = inset.child().item(single::item().width(Sizing::grow()));
                     let mut field = ui.layout(single::layout().padding(Sides::xy(sz::MD, sz::SM)));
                     field.insert(panel(theme::SURFACE));
                     let input = TextInput::new(filter_state, WidgetId::new("filter"), filter)
@@ -373,7 +375,7 @@ pub fn build(ui: Ui<'_>, review: &mut Review, user: &str, consumed: &mut bool) {
                         .placeholder_color(theme::MUTED)
                         .selection_background(theme::SELECTED)
                         .cursor_background(theme::TEXT);
-                    field.child(single::item().width(Sizing::grow())).build(input).changed
+                    field.child().item(single::item().width(Sizing::grow())).build(input).changed
                 });
                 entries.update(files.iter().map(|file| file.diff.path.as_str()), filter);
                 if filter_changed {
@@ -382,7 +384,7 @@ pub fn build(ui: Ui<'_>, review: &mut Review, user: &str, consumed: &mut bool) {
                         picked = entries.shown.iter().position(|&shown| shown);
                     }
                 }
-                pane.child(flex::item().grow()).build(ScrollArea::new(tree, BoundsClip).build(|ui: Ui<'_>| {
+                pane.child().item(flex::item().grow()).build(widgets::scroll_area(tree, |ui: Ui<'_>| {
                     let mut column = ui.layout(flex::column().gap(sz::BORDER));
                     for &position in &entries.visible {
                         let entry = &entries.all[position];
@@ -391,7 +393,7 @@ pub fn build(ui: Ui<'_>, review: &mut Review, user: &str, consumed: &mut bool) {
                         if let Entry::File { index, name, depth } = entry {
                             let file = &files[*index];
                             let id = WidgetId::new(("tree file", *index));
-                            column.child(flex::item()).build(|mut ui: Ui<'_>| {
+                            column.child().item(flex::item()).build(|mut ui: Ui<'_>| {
                                 let interaction = ui.interact(id, Sense::CLICK);
                                 let mut line = ui.widget_id(id).layout(
                                     flex::row()
@@ -408,26 +410,26 @@ pub fn build(ui: Ui<'_>, review: &mut Review, user: &str, consumed: &mut bool) {
                                 } else {
                                     theme::BACKGROUND
                                 }));
-                                line.child(flex::item()).insert(widgets::text(
+                                line.child().item(flex::item()).insert(widgets::text(
                                     if file.viewed { "✓" } else { "·" },
                                     theme::mono(sz::TEXT_SMALL),
                                     if file.viewed { theme::SUCCESS } else { theme::MUTED },
                                 ));
-                                line.child(flex::item().grow()).insert(widgets::text(
+                                line.child().item(flex::item().grow()).insert(widgets::text(
                                     name,
                                     theme::interface(sz::TEXT_SMALL),
                                     if *selected == *index { theme::ACCENT } else { theme::TEXT },
                                 ));
                                 if !file.comments.is_empty() {
                                     let _ = write!(label, "{}●", file.comments.len());
-                                    line.child(flex::item()).insert(widgets::text(label, theme::mono(sz::TEXT_TINY), theme::ACCENT));
+                                    line.child().item(flex::item()).insert(widgets::text(label, theme::mono(sz::TEXT_TINY), theme::ACCENT));
                                 }
-                                line.child(flex::item()).insert(widgets::text(
+                                line.child().item(flex::item()).insert(widgets::text(
                                     &file.added_label,
                                     theme::mono(sz::TEXT_TINY),
                                     theme::SUCCESS,
                                 ));
-                                line.child(flex::item()).insert(widgets::text(
+                                line.child().item(flex::item()).insert(widgets::text(
                                     &file.removed_label,
                                     theme::mono(sz::TEXT_TINY),
                                     theme::DANGER,
@@ -444,7 +446,7 @@ pub fn build(ui: Ui<'_>, review: &mut Review, user: &str, consumed: &mut bool) {
                         let _ = write!(label, "{:width$}{chevron}  {name}", "", width = depth * 2);
                         let id = WidgetId::new(("tree dir", position));
                         let button = Button::new(id, label).look(Look::Quiet).style(theme::interface(sz::TEXT_BODY));
-                        if column.child(flex::item()).build(button) {
+                        if column.child().item(flex::item()).build(button) {
                             if let Entry::Dir { collapsed, .. } = &mut entries.all[position] {
                                 *collapsed = !*collapsed;
                             }
@@ -454,10 +456,10 @@ pub fn build(ui: Ui<'_>, review: &mut Review, user: &str, consumed: &mut bool) {
                 }));
             });
         let mut grip = row
-            .child(flex::item().width(Sizing::fixed(sz::LG)).height(Sizing::grow()))
+            .child().item(flex::item().width(Sizing::fixed(sz::LG)).height(Sizing::grow()))
             .widget_id(divider_id)
             .layout(flex::row().align(Align::Center).justify(Justify::Center));
-        grip.child(flex::item().fixed(sz::XS, sz::XXXL)).insert(
+        grip.child().item(flex::item().fixed(sz::XS, sz::XXXL)).insert(
             Rectangle::new().background(if divider.active || divider.hovered { theme::ACCENT } else { theme::MUTED }),
         );
     }
@@ -473,7 +475,7 @@ pub fn build(ui: Ui<'_>, review: &mut Review, user: &str, consumed: &mut bool) {
         row.focus(WidgetId::new("filter"));
     }
     let anchor = row
-        .child(flex::item().grow())
+        .child().item(flex::item().grow())
         .widget_id(WidgetId::new("diff pane"))
         .transition(transition)
         .build(|ui: Ui<'_>| diff_view::build(ui, review, picked));
@@ -514,7 +516,7 @@ pub fn build(ui: Ui<'_>, review: &mut Review, user: &str, consumed: &mut bool) {
         .width(Sizing::fixed(width))
         .height(Sizing::fit_range(0.0, max_height));
         let mut close = false;
-        row.absolute(placement).parent(NodeTarget::Root).z_index(10).build(ScrollArea::new(popup, BoundsClip).build(|ui: Ui<'_>| {
+        row.absolute(placement).parent(NodeTarget::Root).z_index(10).build(widgets::scroll_area(popup, |ui: Ui<'_>| {
             close = lines::popover(ui, &mut files[index], line, user, consumed);
         }));
         if close {
@@ -534,7 +536,7 @@ pub fn header(ui: Ui<'_>, index: usize, file: &File, label: &mut String) -> Opti
     let mut row = ui.layout(flex::row().padding(Sides::xy(sz::MD, sz::SM)).gap(sz::MD).align(Align::Center));
     row.insert(Rectangle::new().background(theme::SURFACE));
     let chevron = if file.collapsed { "▸" } else { "▾" };
-    if row.child(flex::item()).build(Button::new(WidgetId::new(("chevron", index)), chevron).look(Look::Quiet)) {
+    if row.child().item(flex::item()).build(Button::new(WidgetId::new(("chevron", index)), chevron).look(Look::Quiet)) {
         action = Some(HeaderAction::Collapse);
     }
     let (status, color) = match file.diff.status {
@@ -543,12 +545,12 @@ pub fn header(ui: Ui<'_>, index: usize, file: &File, label: &mut String) -> Opti
         Status::Renamed => ("renamed", theme::PURPLE),
         Status::Modified => ("modified", theme::WARNING),
     };
-    row.child(flex::item()).build(Tag { label: status, color });
+    row.child().item(flex::item()).build(Tag { label: status, color });
     let bold = TextStyle { weight: 600, ..theme::mono(sz::CODE) };
-    row.child(flex::item().width(Sizing::grow())).insert(widgets::text(&file.display_path, bold, theme::TEXT));
-    row.child(flex::item()).insert(widgets::text(&file.added_label, theme::mono(sz::CODE), theme::SUCCESS));
-    row.child(flex::item()).insert(widgets::text(&file.removed_label, theme::mono(sz::CODE), theme::DANGER));
-    if row.child(flex::item()).build(Checkbox { id: WidgetId::new(("viewed", index)), label: "Reviewed", checked: file.viewed }) {
+    row.child().item(flex::item().width(Sizing::grow())).insert(widgets::text(&file.display_path, bold, theme::TEXT));
+    row.child().item(flex::item()).insert(widgets::text(&file.added_label, theme::mono(sz::CODE), theme::SUCCESS));
+    row.child().item(flex::item()).insert(widgets::text(&file.removed_label, theme::mono(sz::CODE), theme::DANGER));
+    if row.child().item(flex::item()).build(Checkbox { id: WidgetId::new(("viewed", index)), label: "Reviewed", checked: file.viewed }) {
         action = Some(HeaderAction::Viewed);
     }
     let count = file.comments.iter().filter(|comment| matches!(comment.anchor, Anchor::File)).count() + file.outdated.len();
@@ -560,7 +562,7 @@ pub fn header(ui: Ui<'_>, index: usize, file: &File, label: &mut String) -> Opti
         label.as_str()
     };
     let comment = Button::new(WidgetId::new(("file comment", index)), label).look(Look::Quiet).style(theme::interface(sz::TEXT_SMALL));
-    if row.child(flex::item()).build(comment) {
+    if row.child().item(flex::item()).build(comment) {
         action = Some(HeaderAction::Comment);
     }
     if action.is_some() {

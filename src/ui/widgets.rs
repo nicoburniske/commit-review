@@ -1,13 +1,15 @@
 //! Small widgets the views share: buttons, tags, a checkbox, scroll areas.
 
-use blit::{Interaction, Sense, Sides, Widget, WidgetId};
-use blit_desktop::atom::Rectangle;
-use blit_desktop::color::Color;
-use blit_desktop::layout::{flex, Align};
-use blit_desktop::style::{Border, BorderRadius};
-use blit_desktop::text::{HorizontalAlign, TextOptions, TextStyle, TextWrap, VerticalAlign};
-use blit_desktop::widget::{scroll, Text};
-use blit_desktop::{BoundsClip, DesktopPlatform, Ui};
+use blit::{Content, Interaction, Sense, Sides, Widget, WidgetId};
+use blit_gui::{
+    GuiContext, Ui,
+    atom::Rectangle,
+    color::Color,
+    layout::{flex, Align},
+    style::{Border, BorderRadius},
+    text::{HorizontalAlign, TextOptions, TextStyle, TextWrap, VerticalAlign},
+    widget::{scroll_area, Text},
+};
 
 use super::theme::{self, sz};
 
@@ -67,7 +69,7 @@ impl<'a> Button<'a> {
     }
 }
 
-impl Widget<DesktopPlatform> for Button<'_> {
+impl Widget<GuiContext> for Button<'_> {
     type Response = bool;
 
     fn build(self, mut ui: Ui<'_>) -> bool {
@@ -81,14 +83,14 @@ impl Widget<DesktopPlatform> for Button<'_> {
                 .border(border.map_or(Border::None, |color| Border::solid(sz::BORDER, color)))
                 .radius(BorderRadius::uniform(sz::RADIUS)),
         );
-        button.child(flex::item()).insert(text(self.label, self.style, color));
+        button.child().item(flex::item()).insert(text(self.label, self.style, color));
         if let Some(shortcut) = self.shortcut {
             let color = if self.look == Look::Primary || interaction.active { color } else { theme::MUTED };
-            let mut hint = button.child(flex::item()).layout(flex::row().padding(Sides::xy(sz::XS, sz::XXS)));
+            let mut hint = button.child().item(flex::item()).layout(flex::row().padding(Sides::xy(sz::XS, sz::XXS)));
             hint.insert(
                 Rectangle::new().background(theme::SHORTCUT_BACKGROUND).radius(BorderRadius::uniform(sz::XS)),
             );
-            hint.child(flex::item()).insert(text(shortcut, theme::mono(sz::TEXT_TINY), color));
+            hint.child().item(flex::item()).insert(text(shortcut, theme::mono(sz::TEXT_TINY), color));
         }
         interaction.clicked
     }
@@ -121,13 +123,13 @@ pub struct Tag<'a> {
     pub color: Color,
 }
 
-impl Widget<DesktopPlatform> for Tag<'_> {
+impl Widget<GuiContext> for Tag<'_> {
     type Response = ();
 
     fn build(self, ui: Ui<'_>) {
         let mut tag = ui.layout(flex::row().padding(Sides::xy(sz::MD, sz::XXS)));
         tag.insert(Rectangle::new().background(theme::BACKGROUND).border(Border::solid(sz::BORDER, theme::BORDER)));
-        tag.child(flex::item()).insert(text(self.label, theme::interface(sz::TEXT_LABEL), self.color));
+        tag.child().item(flex::item()).insert(text(self.label, theme::interface(sz::TEXT_LABEL), self.color));
     }
 }
 
@@ -138,7 +140,7 @@ pub struct Checkbox<'a> {
     pub checked: bool,
 }
 
-impl Widget<DesktopPlatform> for Checkbox<'_> {
+impl Widget<GuiContext> for Checkbox<'_> {
     type Response = bool;
 
     fn build(self, mut ui: Ui<'_>) -> bool {
@@ -149,7 +151,7 @@ impl Widget<DesktopPlatform> for Checkbox<'_> {
                 .background(if interaction.hovered { theme::RAISED } else { Color::TRANSPARENT })
                 .radius(BorderRadius::uniform(sz::RADIUS)),
         );
-        row.child(flex::item().fixed(sz::CHECKBOX, sz::CHECKBOX)).build(|ui: Ui<'_>| {
+        row.child().item(flex::item().fixed(sz::CHECKBOX, sz::CHECKBOX)).build(|ui: Ui<'_>| {
             let mut tick = ui;
             tick.insert(
                 Rectangle::new()
@@ -164,34 +166,26 @@ impl Widget<DesktopPlatform> for Checkbox<'_> {
                 }));
             }
         });
-        row.child(flex::item()).insert(text(self.label, theme::interface(sz::TEXT_SMALL), theme::TEXT));
+        row.child().item(flex::item()).insert(text(self.label, theme::interface(sz::TEXT_SMALL), theme::TEXT));
         interaction.clicked
     }
 }
 
-/// a dedicated scrollbar rail with a square thumb
-#[derive(Clone, Copy, Default)]
-pub struct Thumb;
+pub fn scroll_area<'a, C>(state: &'a mut scroll_area::State, content: C) -> impl Widget<GuiContext> + 'a
+where
+    C: Widget<GuiContext> + 'a,
+{
+    scroll_area::new(state, scroll_area::Config::new().behavior(scroll_behavior()), content, scrollbar)
+}
 
-pub type ScrollArea<'a, C = ()> = scroll::Area<'a, DesktopPlatform, BoundsClip, Thumb, C>;
-pub type VirtualList<'a, T, K = (), F = ()> = scroll::VirtualList<'a, DesktopPlatform, T, BoundsClip, Thumb, K, F>;
+pub fn scroll_behavior() -> scroll_area::Behavior {
+    scroll_area::Behavior::new().scroll_speed(3.0).scrollbar_thickness(sz::SCROLLBAR).minimum_thumb_extent(sz::XXXL)
+}
 
-impl scroll::Scrollbar for Thumb {
-    const HAS_TRACK: bool = true;
-    const HAS_THUMB: bool = true;
-
-    type Track = Rectangle;
-    type Thumb = Rectangle;
-
-    fn config(&self) -> scroll::Config {
-        scroll::Config::new().scroll_speed(3.0).scrollbar_thickness(sz::SCROLLBAR).minimum_thumb_extent(sz::XXXL)
-    }
-
-    fn into_content(self, active: bool) -> (Self::Track, Self::Thumb) {
-        let color = if active { theme::ACCENT } else { theme::MUTED };
-        (
-            Rectangle::new().background(theme::BACKGROUND).border(Border::solid(sz::BORDER, theme::BORDER)),
-            Rectangle::new().background(color).border(Border::solid(sz::BORDER_STRONG, theme::BACKGROUND)),
-        )
-    }
+pub fn scrollbar(active: bool) -> (Option<impl Content<GuiContext>>, Option<impl Content<GuiContext>>) {
+    let color = if active { theme::ACCENT } else { theme::MUTED };
+    (
+        Some(Rectangle::new().background(theme::BACKGROUND).border(Border::solid(sz::BORDER, theme::BORDER))),
+        Some(Rectangle::new().background(color).border(Border::solid(sz::BORDER_STRONG, theme::BACKGROUND))),
+    )
 }

@@ -6,8 +6,10 @@ description = "Human review gate before a commit started by Claude Code"
 
 [dependencies]
 blit = { git = "https://github.com/nicoburniske/blit" }
-blit-cpu = { git = "https://github.com/nicoburniske/blit" }
-blit-desktop = { git = "https://github.com/nicoburniske/blit" }
+blit-desktop = { git = "https://github.com/nicoburniske/blit", features = [
+  "gpu",
+] }
+blit-gui = { git = "https://github.com/nicoburniske/blit" }
 blit-text = { git = "https://github.com/nicoburniske/blit" }
 blit-text-cosmic = { git = "https://github.com/nicoburniske/blit" }
 serde = { version = "1", features = ["derive"] }

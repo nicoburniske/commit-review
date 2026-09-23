@@ -12,12 +12,14 @@ mod widgets;
 use std::cell::RefCell;
 
 use blit::{Absolute, Anchor, Input, Key, Point, PointerButton, Sense, Sides, Sizing, WidgetId};
-use blit_cpu::{BackendFontFaceId, FontFace, RendererConfig, TextLayoutEngine};
-use blit_desktop::atom::Rectangle;
-use blit_desktop::layout::{flex, Align};
-use blit_desktop::widget::{performance, popover, text_input, Performance};
-use blit_desktop::{Application, Config, DesktopPlatform, EventLoopProxy, Root, Ui};
-use blit_text::{FontStyle, SystemFontRequest};
+use blit_desktop::{cpu, Application, Config, EventLoopProxy, Root};
+use blit_gui::{
+    FontFamily, GuiContext, TextConfig, TextLayoutEngine, Ui,
+    atom::Rectangle,
+    layout::{flex, Align, Justify},
+    widget::{performance, popover, scroll_area, text_input, Performance},
+};
+use blit_text::{FontFaceId, FontStyle, SystemFontRequest};
 
 use crate::{Context, Output};
 use text_area::TextArea;
@@ -49,42 +51,43 @@ const ACCEPT_SHORTCUT: &str = if cfg!(target_os = "macos") { "⌘ ↵" } else { 
 /// Opens the window. Every decision leaves the process from inside it, so
 /// this returns only when the window is closed without one.
 pub fn run(command: Option<String>, output: Output) -> Result<(), String> {
-    let mut engine: Box<dyn TextLayoutEngine> = Box::new(blit_text_cosmic::Backend::new());
-    let fonts = fonts(engine.as_mut())?;
+    let mut engine = blit_text_cosmic::Backend::new();
+    let fonts = fonts(&mut engine)?;
     LAUNCH.with(|launch| *launch.borrow_mut() = Some((command, output)));
     blit_desktop::run::<App>(Config {
         title: "Commit review".into(),
         width: 1100,
         height: 800,
-        renderer: RendererConfig {
+        text_config: TextConfig {
             fonts,
             text_cache_capacity: 1 << 20,
             layout_cache_capacity: 2 << 20,
-            glyph_cache_capacity: 1 << 20,
-            shadow_cache_capacity: 1 << 19,
         },
         text: engine,
+        graphics: Box::new(cpu::Backend::new(cpu::Config::default())),
     })
     .map_err(|e| e.to_string())
 }
 
 /// A regular and a semibold face for each of the two fonts, from the system.
-fn fonts(engine: &mut dyn TextLayoutEngine) -> Result<Vec<FontFace>, String> {
-    let mut faces = Vec::new();
+fn fonts(engine: &mut blit_text_cosmic::Backend) -> Result<Vec<FontFamily>, String> {
+    let mut fonts = Vec::new();
     for (id, families) in [(theme::UI_FONT, MONO), (theme::MONO, MONO)] {
         let (family, regular) = families
             .iter()
             .find_map(|family| Some((*family, system_font(engine, family, 400)?)))
             .ok_or_else(|| format!("no font found among {}", families.join(", ")))?;
         let bold = system_font(engine, family, 600).unwrap_or(regular);
-        for (weight, face) in [(400, regular), (600, bold)] {
-            faces.push(FontFace { id, weight, stretch: 100, style: FontStyle::Normal, face });
+        let mut family = vec![engine.font_face(regular).ok_or("font disappeared")?.data.clone()];
+        if bold != regular {
+            family.push(engine.font_face(bold).ok_or("font disappeared")?.data.clone());
         }
+        fonts.push(FontFamily { id, fonts: family });
     }
-    Ok(faces)
+    Ok(fonts)
 }
 
-fn system_font(engine: &mut dyn TextLayoutEngine, family: &str, weight: u16) -> Option<BackendFontFaceId> {
+fn system_font(engine: &mut blit_text_cosmic::Backend, family: &str, weight: u16) -> Option<FontFaceId> {
     engine.system_font(SystemFontRequest { family, weight, stretch: 100, style: FontStyle::Normal }).ok()
 }
 
@@ -117,7 +120,7 @@ pub struct App {
     context: Result<Context, String>,
     review: review::Review,
     panel: Option<Panel>,
-    panel_scroll: [blit_desktop::widget::scroll::State; 4],
+    panel_scroll: [scroll_area::State; 4],
     performance_open: bool,
     notes: String,
     notes_state: text_input::State,
@@ -127,7 +130,7 @@ pub struct App {
 impl Application for App {
     type Input = ();
 
-    fn new(_: EventLoopProxy<()>, _: Root<Self>, _: &mut DesktopPlatform) -> Self {
+    fn new(_: EventLoopProxy<()>, _: Root<Self>, _: &mut GuiContext) -> Self {
         let (command, output) = LAUNCH.with(|launch| launch.borrow_mut().take()).expect("launch set by run");
         let mut review = review::Review::default();
         review.open(command.as_deref());
@@ -186,15 +189,15 @@ impl Application for App {
             }
             _ => {}
         }
-        root.child(flex::item()).build(|ui: Ui<'_>| {
+        root.child().item(flex::item()).build(|ui: Ui<'_>| {
             let mut bar = ui.layout(flex::row().gap(sz::LG).align(Align::Center));
-            bar.child(flex::item()).insert(text("REVIEW", theme::bold(sz::TEXT_SMALL), theme::ACCENT));
+            bar.child().item(flex::item()).insert(text("REVIEW", theme::bold(sz::TEXT_SMALL), theme::ACCENT));
             let repo = self.context.as_ref().map_or("Changes", |context| context.repo.trim().rsplit('/').next().unwrap_or(&context.repo));
-            bar.child(flex::item().grow()).insert(text(repo, theme::interface(sz::TEXT_SMALL), theme::MUTED));
+            bar.child().item(flex::item().grow()).insert(text(repo, theme::interface(sz::TEXT_SMALL), theme::MUTED));
             let (viewed, total) = self.review.viewed();
-            bar.child(flex::item()).insert(text(&format!("{viewed} / {total} reviewed"), theme::mono(sz::TEXT_SMALL), theme::MUTED));
+            bar.child().item(flex::item()).insert(text(&format!("{viewed} / {total} reviewed"), theme::mono(sz::TEXT_SMALL), theme::MUTED));
             for (panel, label) in [(Panel::Details, "Details"), (Panel::Help, "?")] {
-                if bar.child(flex::item()).build(Button::new(panel.trigger(), label).look(if self.panel == Some(panel) {
+                if bar.child().item(flex::item()).build(Button::new(panel.trigger(), label).look(if self.panel == Some(panel) {
                     Look::Selected
                 } else {
                     Look::Quiet
@@ -204,13 +207,13 @@ impl Application for App {
             }
         });
         if let Err(error) = &self.context {
-            root.child(flex::item()).insert(widgets::wrapped(error, theme::interface(sz::TEXT_SMALL), theme::DANGER));
+            root.child().item(flex::item()).insert(widgets::wrapped(error, theme::interface(sz::TEXT_SMALL), theme::DANGER));
         }
         let mut consumed = previous.is_some() || self.panel.is_some();
         let user = self.context.as_ref().map_or("You", |context| context.user.as_str());
-        root.child(flex::item().grow()).build(|ui: Ui<'_>| review::build(ui, &mut self.review, user, &mut consumed));
+        root.child().item(flex::item().grow()).build(|ui: Ui<'_>| review::build(ui, &mut self.review, user, &mut consumed));
 
-        root.child(flex::item()).build(|ui: Ui<'_>| {
+        root.child().item(flex::item()).build(|ui: Ui<'_>| {
             let mut bar = ui.layout(flex::row().gap(sz::MD).align(Align::Center));
             let comments = format!("Comments {}", self.review.pending());
             for (panel, label) in [(Panel::Feedback, "Feedback"), (Panel::Comments, comments.as_str())] {
@@ -219,13 +222,13 @@ impl Application for App {
                 if panel == Panel::Feedback {
                     button = button.shortcut("n");
                 }
-                if bar.child(flex::item()).build(button) {
+                if bar.child().item(flex::item()).build(button) {
                     self.panel = (self.panel != Some(panel)).then_some(panel);
                 }
             }
-            bar.child(flex::item().grow()).build(());
+            bar.child().item(flex::item().grow()).build(());
             if self.performance_open {
-                bar.child(flex::item()).build(
+                bar.child().item(flex::item()).build(
                     Performance::new(&mut self.performance)
                         .popover(
                             popover::Config::new()
@@ -241,10 +244,10 @@ impl Application for App {
                         .accent(theme::ACCENT),
                 );
             }
-            if bar.child(flex::item()).build(Button::new(WidgetId::new("deny"), "Request changes")) {
+            if bar.child().item(flex::item()).build(Button::new(WidgetId::new("deny"), "Request changes")) {
                 action = Some(Action::Deny);
             }
-            if bar.child(flex::item()).build(Button::new(WidgetId::new("accept"), "Approve").shortcut(ACCEPT_SHORTCUT).look(Look::Primary))
+            if bar.child().item(flex::item()).build(Button::new(WidgetId::new("accept"), "Approve").shortcut(ACCEPT_SHORTCUT).look(Look::Primary))
             {
                 action = Some(Action::Accept);
             }
@@ -273,11 +276,11 @@ impl Application for App {
                     ui.interact(popup_id, Sense::CLICK);
                     let mut card = ui.widget_id(popup_id).layout(flex::column().padding(Sides::all(sz::LG)).gap(sz::MD));
                     card.insert(panel_surface(theme::SURFACE));
-                    card.child(flex::item()).insert(text(title, theme::bold(sz::TEXT_SMALL), theme::MUTED));
+                    card.child().item(flex::item()).insert(text(title, theme::bold(sz::TEXT_SMALL), theme::MUTED));
                     let body_height = (height - sz::LG * 2.0 - sz::MD * 2.0 - sz::LINE - sz::XXXL).max(0.0);
                     let body_height = if panel == Panel::Feedback { body_height.min(sz::POPOVER_HEIGHT) } else { body_height };
-                    card.child(flex::item().height(Sizing::fit_range(0.0, body_height))).build(
-                        widgets::ScrollArea::new(&mut self.panel_scroll[panel as usize], blit_desktop::BoundsClip).build(|ui: Ui<'_>| {
+                    card.child().item(flex::item().height(Sizing::fit_range(0.0, body_height))).build(
+                        widgets::scroll_area(&mut self.panel_scroll[panel as usize], |ui: Ui<'_>| {
                             match panel {
                                 Panel::Details => {
                                     if let Some(line) = summary::build(ui, &self.context) {
@@ -304,13 +307,13 @@ impl Application for App {
                                     let mut list = ui.layout(flex::column().gap(sz::MD));
                                     if let Some(Ok(files)) = &self.review.files {
                                         for (index, file) in files.iter().enumerate().filter(|(_, file)| !file.comments.is_empty()) {
-                                            list.child(flex::item()).insert(widgets::wrapped(
+                                            list.child().item(flex::item()).insert(widgets::wrapped(
                                                 &file.display_path,
                                                 theme::bold(sz::TEXT_SMALL),
                                                 theme::ACCENT,
                                             ));
                                             for comment in &file.comments {
-                                                list.child(flex::item()).build(|mut ui: Ui<'_>| {
+                                                list.child().item(flex::item()).build(|mut ui: Ui<'_>| {
                                                     let id = comment.id.child("summary");
                                                     let interaction = ui.interact(id, Sense::CLICK);
                                                     if interaction.activated {
@@ -327,12 +330,12 @@ impl Application for App {
                                                     let location = crate::text::location(&file.diff, comment.anchor);
                                                     let location =
                                                         location.strip_prefix(&file.diff.path).unwrap_or(&location).trim_start_matches(':');
-                                                    entry.child(flex::item()).insert(text(
+                                                    entry.child().item(flex::item()).insert(text(
                                                         location,
                                                         theme::mono(sz::TEXT_SMALL),
                                                         theme::MUTED,
                                                     ));
-                                                    entry.child(flex::item().height(Sizing::fit_range(0.0, sz::LINE * 2.0))).insert(
+                                                    entry.child().item(flex::item().height(Sizing::fit_range(0.0, sz::LINE * 2.0))).insert(
                                                         widgets::wrapped(
                                                             comment.text.lines().next().unwrap_or(""),
                                                             theme::interface(sz::TEXT_BODY),
@@ -344,7 +347,7 @@ impl Application for App {
                                         }
                                     }
                                     if self.review.pending() == 0 {
-                                        list.child(flex::item()).insert(text(
+                                        list.child().item(flex::item()).insert(text(
                                             "No comments yet",
                                             theme::interface(sz::TEXT_BODY),
                                             theme::MUTED,
@@ -378,20 +381,20 @@ impl Application for App {
                                                 [..],
                                         ),
                                     ] {
-                                        list.child(flex::item()).insert(text(section, theme::bold(sz::TEXT_LABEL), theme::MUTED));
+                                        list.child().item(flex::item()).insert(text(section, theme::bold(sz::TEXT_LABEL), theme::MUTED));
                                         for &(key, label) in bindings {
-                                            list.child(flex::item()).build(|ui: Ui<'_>| {
+                                            list.child().item(flex::item()).build(|ui: Ui<'_>| {
                                                 let mut line = ui.layout(flex::row().gap(sz::LG));
-                                                line.child(flex::item().grow()).insert(text(
+                                                line.child().item(flex::item().grow()).insert(text(
                                                     label,
                                                     theme::interface(sz::TEXT_SMALL),
                                                     theme::TEXT,
                                                 ));
-                                                line.child(flex::item()).insert(text(key, theme::mono(sz::TEXT_SMALL), theme::ACCENT));
+                                                line.child().item(flex::item()).insert(text(key, theme::mono(sz::TEXT_SMALL), theme::ACCENT));
                                             });
                                         }
                                     }
-                                    list.child(flex::item()).insert(widgets::wrapped(
+                                    list.child().item(flex::item()).insert(widgets::wrapped(
                                         "Drag a line’s + to comment on a range. Navigation shortcuts pause while typing.",
                                         theme::interface(sz::TEXT_SMALL),
                                         theme::MUTED,
@@ -400,10 +403,10 @@ impl Application for App {
                             }
                         }),
                     );
-                    card.child(flex::item()).build(|ui: Ui<'_>| {
-                        let mut actions = ui.layout(flex::row().justify(blit_desktop::layout::Justify::End));
+                    card.child().item(flex::item()).build(|ui: Ui<'_>| {
+                        let mut actions = ui.layout(flex::row().justify(Justify::End));
                         dismiss |= actions
-                            .child(flex::item())
+                            .child().item(flex::item())
                             .build(Button::new(popup_id.child("done"), "Done").style(theme::interface(sz::TEXT_SMALL)));
                     });
                 });

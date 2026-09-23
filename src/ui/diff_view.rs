@@ -1,10 +1,12 @@
 //! diff row measurement, selection and floating comment anchors
 
-use blit::{Axis, Constraints, Input, Layout, LayoutCx, Platform, Point, PointerButton, Sense, Sides, Size, Sizing, WidgetId};
-use blit_desktop::atom::Rectangle;
-use blit_desktop::layout::{flex, single, Align};
-use blit_desktop::widget::scroll;
-use blit_desktop::{BoundsClip, Ui};
+use blit::{Axis, Constraints, Input, Layout, LayoutCx, Point, PointerButton, Sense, Sides, Size, Sizing, WidgetId};
+use blit_gui::{
+    Ui,
+    atom::Rectangle,
+    layout::{flex, single, Align},
+    widget::virtual_list,
+};
 
 use super::review::{self, Comment, HeaderAction, Review, Thread};
 use super::{
@@ -17,7 +19,7 @@ use crate::text::Anchor;
 
 #[derive(Default)]
 pub struct State {
-    pub list: scroll::MeasuredState,
+    pub list: virtual_list::State,
     pub rows_dirty: bool,
     rows: Vec<Row>,
     label: String,
@@ -168,15 +170,18 @@ pub fn build(mut ui: Ui<'_>, review: &mut Review, reveal: Option<usize>) -> Opti
     let mut context_action = None;
     let mut open_anchor = None;
     let mut visible_file = None;
-    let response = ui.build(
-        widgets::VirtualList::new(&mut state.list, BoundsClip, &state.rows)
-            .key(|row| row.id(*split))
+    let response = ui.build(virtual_list::new(
+        &mut state.list,
+        &state.rows,
+        virtual_list::Config::new()
+            .behavior(widgets::scroll_behavior())
             .edge_scroll(match input {
                 Input::PointerUp { button: PointerButton::Primary, .. } => false,
                 Input::Key(key) if key.pressed && key.key == blit::Key::Escape => false,
                 _ => drag.is_some(),
-            })
-            .build(|ui: Ui<'_>, row| {
+            }),
+        |row| row.id(*split),
+        |ui: Ui<'_>, row| {
                 let mut ui = ui.widget_id(row.id(*split));
                 if state.follow_scroll && visible_file.is_none() && matches!(row.kind, Kind::Header | Kind::Code { .. }) {
                     if let (Some(viewport), Some(area)) = (viewport, ui.geometry(row.id(*split))) {
@@ -201,12 +206,12 @@ pub fn build(mut ui: Ui<'_>, review: &mut Review, reveal: Option<usize>) -> Opti
                     }
                     Kind::Separator { heading, context } => {
                         let file = &files[row.file];
-                        use blit_desktop::text::{HorizontalAlign, TextOptions, VerticalAlign};
+                        use blit_gui::text::{HorizontalAlign, TextOptions, VerticalAlign};
                         use ContextAction::*;
                         let mut bar =
                             ui.layout(flex::row().padding(Sides::y(if context.is_none() { sz::XXS } else { 0.0 })).align(Align::Center));
                         bar.insert(Rectangle::new().background(theme::HUNK));
-                        let mut controls = bar.child(flex::item().width(Sizing::fixed(sz::GUTTER))).layout(flex::row());
+                        let mut controls = bar.child().item(flex::item().width(Sizing::fixed(sz::GUTTER))).layout(flex::row());
                         if let Some(gap) = context {
                             let context = &file.context[gap];
                             let remaining = context.total.map(|count| count - context.before - context.after);
@@ -224,7 +229,7 @@ pub fn build(mut ui: Ui<'_>, review: &mut Review, reveal: Option<usize>) -> Opti
                             ] {
                                 if show {
                                     let id = WidgetId::new(("context", row.file, gap, action == Collapse));
-                                    let mut button = controls.child(flex::item().fixed(sz::XXL, sz::XXL)).widget_id(id);
+                                    let mut button = controls.child().item(flex::item().fixed(sz::XXL, sz::XXL)).widget_id(id);
                                     let interaction = button.interact(id, Sense::CLICK);
                                     let lit = interaction.hovered || interaction.active;
                                     button.insert(Rectangle::new().background(if lit { theme::ACCENT } else { theme::SELECTED }));
@@ -251,10 +256,10 @@ pub fn build(mut ui: Ui<'_>, review: &mut Review, reveal: Option<usize>) -> Opti
                         drop(controls);
                         if let Some(Err(error)) = &file.source {
                             if context.is_some() {
-                                bar.child(flex::item().grow()).insert(widgets::wrapped(error, theme::mono(sz::TEXT_SMALL), theme::MUTED));
+                                bar.child().item(flex::item().grow()).insert(widgets::wrapped(error, theme::mono(sz::TEXT_SMALL), theme::MUTED));
                             }
                         } else if let Some(hunk) = heading {
-                            bar.child(flex::item().grow()).insert(widgets::text(
+                            bar.child().item(flex::item().grow()).insert(widgets::text(
                                 &file.diff.hunks[hunk].header,
                                 theme::mono(sz::CODE),
                                 theme::MUTED,
@@ -275,9 +280,9 @@ pub fn build(mut ui: Ui<'_>, review: &mut Review, reveal: Option<usize>) -> Opti
                         pair.insert(Rectangle::new().background(theme::SURFACE));
                         for (source, side) in [(left, false), (right, true)].into_iter().take(if *split { 2 } else { 1 }) {
                             if side {
-                                pair.child(()).insert(Rectangle::new().background(theme::BORDER));
+                                pair.child().item(()).insert(Rectangle::new().background(theme::BORDER));
                             }
-                            let cell = pair.child(());
+                            let cell = pair.child().item(());
                             let Some(source) = source else { continue };
                             let side = (*split).then_some(side);
                             let (line, flat) = match source {
@@ -305,20 +310,23 @@ pub fn build(mut ui: Ui<'_>, review: &mut Review, reveal: Option<usize>) -> Opti
                                     open_anchor = Some(WidgetId::new(("plus", row.file, flat)));
                                 }
                             }
-                            lines::line_row(cell, row.file, flat, line, highlighted, commented, show_plus, side, &mut started);
+                            cell.build(|ui: Ui<'_>| {
+                                lines::line_row(ui, row.file, flat, line, highlighted, commented, show_plus, side, &mut started)
+                            });
                         }
                     }
                     Kind::Binary => {
                         let mut row = ui.layout(single::layout().padding(Sides::xy(sz::LG, sz::MD)));
-                        row.child(single::item()).insert(widgets::text(
+                        row.child().item(single::item()).insert(widgets::text(
                             "Binary file, no diff.",
                             theme::interface(sz::TEXT_SMALL),
                             theme::MUTED,
                         ));
                     }
                 }
-            }),
-    );
+        },
+        widgets::scrollbar,
+    ));
     // extend or finish the comment selection
     if let Some(started) = started {
         *drag = Some(started);
@@ -464,7 +472,7 @@ impl Row {
 // children are left then optionally divider and right
 struct CodeLayout;
 
-impl<R: Platform> Layout<R> for CodeLayout {
+impl<R> Layout<R> for CodeLayout {
     type Item = ();
 
     fn layout(&self, ui: &mut LayoutCx<'_, R, ()>, constraints: Constraints) -> Size {
@@ -485,7 +493,4 @@ impl<R: Platform> Layout<R> for CodeLayout {
         size
     }
 
-    fn override_size(&self, _: &mut (), _: Option<f32>, _: Option<f32>) -> bool {
-        false
-    }
 }
