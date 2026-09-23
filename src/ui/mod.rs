@@ -5,6 +5,7 @@ mod lines;
 mod marked;
 mod review;
 mod summary;
+mod syntax;
 mod text_area;
 mod theme;
 mod widgets;

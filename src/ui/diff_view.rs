@@ -311,7 +311,8 @@ pub fn build(mut ui: Ui<'_>, review: &mut Review, reveal: Option<usize>) -> Opti
                                 }
                             }
                             cell.build(|ui: Ui<'_>| {
-                                lines::line_row(ui, row.file, flat, line, highlighted, commented, show_plus, side, &mut started)
+                                let syntax = flat.map(|flat| file.syntax.line(flat)).unwrap_or_default();
+                                lines::line_row(ui, row.file, flat, line, syntax, highlighted, commented, show_plus, side, &mut started)
                             });
                         }
                     }

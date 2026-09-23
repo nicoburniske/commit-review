@@ -20,7 +20,7 @@ use crate::text::{self, Anchor};
 
 use super::theme::{self, sz};
 use super::widgets::{self, panel, Button, Checkbox, Look, Tag};
-use super::{diff_view, lines};
+use super::{diff_view, lines, syntax};
 
 pub fn scope_label(scope: Scope) -> &'static str {
     match scope {
@@ -32,6 +32,7 @@ pub fn scope_label(scope: Scope) -> &'static str {
 
 pub struct File {
     pub diff: FileDiff,
+    pub syntax: syntax::Highlights,
     pub display_path: String,
     pub added_label: String,
     pub removed_label: String,
@@ -125,12 +126,14 @@ impl From<crate::Change> for File {
             })
             .chain(std::iter::once(Default::default()))
             .collect();
+        let syntax = syntax::highlight(&change.diff);
         let mut file = File {
             context,
             source: None,
             collapsed: change.viewed,
             viewed: change.viewed,
             diff: change.diff,
+            syntax,
             display_path,
             added_label: format!("+{added}"),
             removed_label: format!("-{removed}"),

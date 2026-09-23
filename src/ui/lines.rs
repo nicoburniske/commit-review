@@ -7,13 +7,15 @@ use blit_gui::{
     color::Color,
     layout::{flex, single, Align, Justify},
     style::BorderRadius,
-    text::{HorizontalAlign, TextOptions, TextWrap, VerticalAlign},
+    text::{HorizontalAlign, Span, TextOptions, TextWrap, VerticalAlign},
+    widget::RichText,
 };
 
 use crate::diff::{Kind, Line};
 use crate::text::{self, Anchor};
 
 use super::review::{Comment, Drag, File, Outdated};
+use super::syntax::Highlight;
 use super::text_area::TextArea;
 use super::theme::{self, sz};
 use super::widgets::{self, panel, Button, Look, Tag};
@@ -98,6 +100,7 @@ pub fn line_row(
     index: usize,
     flat: Option<usize>,
     line: &Line,
+    syntax: &[Highlight],
     highlighted: bool,
     commented: bool,
     show_plus: Option<bool>,
@@ -156,7 +159,19 @@ pub fn line_row(
     }
     cells.child().item(Cell::Marker).insert(widgets::text(marker, mono, theme::MUTED));
     let options = TextOptions { wrap: TextWrap::Character, ..TextOptions::default() };
-    cells.child().item(Cell::Code).insert(widgets::text(&line.text, mono, theme::TEXT).options(options));
+    if syntax.is_empty() {
+        cells.child().item(Cell::Code).insert(widgets::text(&line.text, mono, theme::TEXT).options(options));
+    } else {
+        let spans = syntax
+            .iter()
+            .filter_map(|highlight| {
+                line.text
+                    .get(highlight.range.clone())
+                    .map(|text| Span::new(text).color(highlight.color))
+            })
+            .collect::<Vec<_>>();
+        cells.child().item(Cell::Code).insert(RichText::new(&spans).style(mono).color(theme::TEXT).options(options));
+    }
 }
 
 struct LineLayout {
